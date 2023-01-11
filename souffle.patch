@@ -1,0 +1,4558 @@
+diff --git a/README.md b/README.md
+index d96038d17..36b9e38b2 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,64 @@
+ [![Build Status](https://ci.tlcpack.ai/buildStatus/icon?job=tvm/main)](https://ci.tlcpack.ai/job/tvm/job/main/)
+ [![WinMacBuild](https://github.com/apache/tvm/workflows/WinMacBuild/badge.svg)](https://github.com/apache/tvm/actions?query=workflow%3AWinMacBuild)
+ 
++# Souffle
++
++This is a DNN fusion framework that implements our paper *"Think Big, Act Small: Optimizing Deep Learning Inference via Global Analysis and Tensor Expressions"* and is based on TVM v0.8.
++In this released version it can fuse ResNext-like parallel branches into one tensor expression (TE).
++For example, it can fuse the following subgraph
++```
++          conv2d   conv2d     conv2d
++            |         |          |
++            |         |          |
++      batch_norm   batch_norm  batch_norm
++            |         |          |
++            |         |          |
++          relu       relu      relu
++            \         |         /
++             \        |        /
++                   concat     
++```
++into
++```
++            fused(conv2d+batch_norm+relu)
++```
++The equivalent TE of the `fused(conv2d+batch_norm+relu)` is 
++```Python
++def fused_conv3x3_bn_relu(batch, height, width, in_channels, out_channels, kernel_h, kernel_w, num_input):
++  input_tensor = te.placeholder((batch, num_input, height, width, in_channels), "float32", name="input_tensor")
++  weight_tensor = te.placeholder((num_input, kernel_h, kernel_w, in_channels, out_channels), name="weight_tensor")
++  bnw1 = te.placeholder((batch, num_input, out_channels), name="bnw1")
++  bnw2 = te.placeholder((batch, num_input, out_channels), name="bnw2")
++
++  padded_input_tensor = te.compute((batch, num_input, height+2, width+2, in_channels), \
++    lambda b, n, h, w, ic: te.if_then_else(te.all(h>0, h<height-1, w>0, w<width-1), input_tensor[b, n, h-1, w-1, ic], 0))
++  rk = te.reduce_axis((0, in_channels), name="rk")
++  rx = te.reduce_axis((0, kernel_h), name="rx")
++  ry = te.reduce_axis((0, kernel_w), name="ry")
++  conv_output = te.compute((batch, num_input, height, width, out_channels),\
++    lambda b, n, h, w, oc: te.sum(padded_input_tensor[b, n, h+rx, w+rx, rk] * weight_tensor[n, rx, ry, rk, oc], axis=[rk, rx, ry]))
++  bn_multiply = te.compute((batch, num_input, height, width, out_channels),\
++    lambda b, n, h, w, o: conv_output[b, n, h, w, o] * bnw1[b, n, o])
++  bn_add = te.compute((batch, num_input, height, width, out_channels),\
++    lambda b, n, h, w, o: bn_multiply[b, n, h, w, o] + bnw2[b, n, o])
++  output = te.compute((batch, num_input, height, width, out_channels),\
++    lambda b, n, h, w, o: tir.max(bn_add[b, n, h, w, o], 0))
++
++  return [input_tensor, weight_tensor, bnw1, bnw2, output]
++```
++The variable `num_input` represents the number of branches. And the computation of `bn_multiply` `bn_add`, and `output` are all scheduled by `compute_inline`.
++
++This project is still in active development.
++
++## Build and run
++First, follow the [instructions](https://tvm.apache.org/docs/v0.8.0/install/from_source.html#install-from-source) on the TVM official website to build and install this project.
++Then run the following test the verify the functionality of the project.
++```shell
++cd tests/python/relay/
++python3 test_souffle_fusion.py
++```
++
++# Apache TVM
+ Apache TVM is a compiler stack for deep learning systems. It is designed to close the gap between the
+ productivity-focused deep learning frameworks, and the performance- and efficiency-focused hardware backends.
+ TVM works with deep learning frameworks to provide end to end compilation to different backends.
+diff --git a/gallery/tutorial/auto_scheduler_matmul_x86.py b/gallery/tutorial/auto_scheduler_matmul_x86.py
+index f9fb3615a..7daac1bad 100644
+--- a/gallery/tutorial/auto_scheduler_matmul_x86.py
++++ b/gallery/tutorial/auto_scheduler_matmul_x86.py
+@@ -87,7 +87,7 @@ def matmul_add(N, L, M, dtype):
+ #   - replace "llvm" below with "llvm -mcpu=core-avx2" to enable AVX2
+ #   - replace "llvm" below with "llvm -mcpu=skylake-avx512" to enable AVX-512
+ 
+-target = tvm.target.Target("llvm")
++target = tvm.target.Target("cuda")
+ N = L = M = 1024
+ task = tvm.auto_scheduler.SearchTask(func=matmul_add, args=(N, L, M, "float32"), target=target)
+ 
+@@ -150,7 +150,8 @@ b_np = np.random.uniform(size=(L, M)).astype(np.float32)
+ c_np = np.random.uniform(size=(N, M)).astype(np.float32)
+ out_np = a_np.dot(b_np) + c_np
+ 
+-dev = tvm.cpu()
++# dev = tvm.cpu()
++dev = tvm.cuda()
+ a_tvm = tvm.nd.array(a_np, device=dev)
+ b_tvm = tvm.nd.array(b_np, device=dev)
+ c_tvm = tvm.nd.array(c_np, device=dev)
+diff --git a/include/tvm/relay/function.h b/include/tvm/relay/function.h
+index 9170bc53e..2a7f51935 100644
+--- a/include/tvm/relay/function.h
++++ b/include/tvm/relay/function.h
+@@ -125,6 +125,8 @@ class Function : public BaseFunc {
+ namespace attr {
+ /*! \brief Mark the function as a primitive function. */
+ constexpr const char* kPrimitive = "Primitive";
++/*! \brief Mark the function as a horizontal fusion. */
++constexpr const char* kFusion = "Fusion";
+ /*!
+  * \brief Indicate the compiler that should be used for building this function.
+  * When this is unset or set to "default", the default compilation pipeline will be used.
+diff --git a/include/tvm/relay/transform.h b/include/tvm/relay/transform.h
+index e740776d6..16e96f0da 100644
+--- a/include/tvm/relay/transform.h
++++ b/include/tvm/relay/transform.h
+@@ -104,6 +104,15 @@ TVM_DLL Pass FoldConstant();
+  */
+ TVM_DLL Pass SplitArgs(int max_function_args);
+ 
++/*!
++ * \brief Fuse operations horizontally into expr into seperate functions.
++ *
++ * \param fuse_opt_level Optimization level. If it is -1 it will be inferred from pass context.
++ *
++ * \return The pass.
++ */
++TVM_DLL Pass HorizontalFusion(int fuse_opt_level = -1);
++
+ /*!
+  * \brief Fuse operations into expr into seperate functions.
+  *
+diff --git a/include/tvm/topi/transform.h b/include/tvm/topi/transform.h
+index 3df9caf55..44df2e44f 100644
+--- a/include/tvm/topi/transform.h
++++ b/include/tvm/topi/transform.h
+@@ -371,6 +371,7 @@ inline Tensor squeeze(const Tensor& x, Array<Integer> axis, bool atleast1d = fal
+       name, tag);
+ }
+ 
++
+ /*!
+  * \brief Join a sequence of tensors along an existing axis
+  *
+@@ -430,6 +431,33 @@ inline Tensor concatenate(const Array<Tensor>& inputs, int axis = 0, std::string
+       name, tag);
+ }
+ 
++
++/**
++ * @brief Join a sequance of tensors along the zero axis and reshape to [num_tensor, *input_tensor_shape]
++ * \param inputs The input tensors
++ * \param name The name of the operation
++ * \param tag The tag to mark the operation
++ * 
++ * \return A Tensor whose op member is the concatenate_expand operation
++ */
++inline Tensor concatenate_expand(const Array<Tensor>& inputs, std::string name = "T_concat_expand",
++                          std::string tag = kInjective) {
++  Array<PrimExpr> out_shape{PrimExpr((int32_t)inputs.size())};
++  for (size_t i = 0; i < inputs[0]->shape.size(); ++i) {
++    out_shape.push_back(inputs[0]->shape[i]);
++  }
++  auto temp_out = concatenate(inputs, 0);
++  return compute(out_shape, [&](const Array<Var>& indices){
++    return temp_out(
++      UnravelIndex(
++        RavelIndex(
++          Array<PrimExpr>{indices.begin(), indices.end()}, 
++          out_shape), 
++        temp_out->shape));
++  });
++}
++
++
+ /*!
+  * \brief Join a sequence of tensors along a new axis.
+  *
+diff --git a/python/tvm/auto_scheduler/__init__.py b/python/tvm/auto_scheduler/__init__.py
+index ff6d82a02..25c2fe07d 100644
+--- a/python/tvm/auto_scheduler/__init__.py
++++ b/python/tvm/auto_scheduler/__init__.py
+@@ -41,6 +41,7 @@ from .measure import (
+     LocalRunner,
+     RPCRunner,
+     LocalRPCMeasureContext,
++    RemoteRPCMeasureContext,
+     register_task_input_check_func,
+ )
+ from .measure_record import RecordToFile, RecordReader, load_best_record, load_records, save_records
+diff --git a/python/tvm/auto_scheduler/compute_dag.py b/python/tvm/auto_scheduler/compute_dag.py
+index c212d143f..4c2aa333f 100755
+--- a/python/tvm/auto_scheduler/compute_dag.py
++++ b/python/tvm/auto_scheduler/compute_dag.py
+@@ -105,6 +105,7 @@ class ComputeDAG(Object):
+             compute = workload_key_to_tensors(compute_or_sche)
+             sche = None
+         elif isinstance(compute_or_sche, (list, tvm.ir.container.Array)):
++            print("isinstance(compute_or_sche, (list, tvm.ir.container.Array))")
+             for item in compute_or_sche:
+                 if not isinstance(item, tvm.te.Tensor):
+                     raise ValueError(
+diff --git a/python/tvm/auto_scheduler/measure.py b/python/tvm/auto_scheduler/measure.py
+index 8c6fd5f1a..311f5b893 100644
+--- a/python/tvm/auto_scheduler/measure.py
++++ b/python/tvm/auto_scheduler/measure.py
+@@ -586,6 +586,99 @@ class LocalRPCMeasureContext:
+         time.sleep(0.5)
+ 
+ 
++class RemoteRPCMeasureContext:
++    """A context wrapper for running RPCRunner locally.
++    This will launch a local RPC Tracker and local RPC Server.
++
++    Parameters
++    ----------
++    priority : int = 1
++        The priority of this run request, larger is more prior.
++    n_parallel : int = 1
++        The number of tasks run in parallel.
++    timeout : int = 10
++        The timeout limit (in second) for each run.
++        This is used in a wrapper of the multiprocessing.Process.join().
++    number : int = 3
++        The number of times to run the generated code for taking average.
++        We call these runs as one `repeat` of measurement.
++    repeat : int = 1
++        The number of times to repeat the measurement.
++        In total, the generated code will be run (1 + number x repeat) times,
++        where the first "1" is warm up and will be discarded.
++        The returned result contains `repeat` costs,
++        each of which is an average of `number` costs.
++    min_repeat_ms : int = 0
++        The minimum duration of one `repeat` in milliseconds.
++        By default, one `repeat` contains `number` runs. If this parameter is set,
++        the parameters `number` will be dynamically adjusted to meet the
++        minimum duration requirement of one `repeat`.
++        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
++        will be automatically increased.
++    cooldown_interval : float = 0.0
++        The cool down interval between two measurements in seconds.
++    enable_cpu_cache_flush: bool = False
++        Whether to flush cache on CPU between repeated measurements.
++        Flushing cache can make the measured latency of one operator closer to
++        its actual latency during end-to-end inference.
++        To make this option effective, the argument `number` should also be set to 1.
++        This is only has effect on CPU task.
++    """
++
++    def __init__(
++        self,
++        server_addr,
++        server_port,
++        device_key,
++        priority=1,
++        n_parallel=1,
++        timeout=10,
++        number=3,
++        repeat=1,
++        min_repeat_ms=0,
++        cooldown_interval=0.0,
++        enable_cpu_cache_flush=False,
++    ):
++        # pylint: disable=import-outside-toplevel
++        from tvm.rpc.tracker import Tracker
++        from tvm.rpc.server import Server
++
++        dev = tvm.device("cuda", 0)
++        if dev.exist:
++            cuda_arch = "sm_" + "".join(dev.compute_version.split("."))
++            set_cuda_target_arch(cuda_arch)
++        # self.tracker = Tracker(port=9090, port_end=10000, silent=True)
++        # device_key = "$remote$device$%d" % self.tracker.port
++        # self.server = Server(
++        #     port=self.tracker.port,
++        #     port_end=10000,
++        #     key=device_key,
++        #     silent=True,
++        #     tracker_addr=("127.0.0.1", self.tracker.port),
++        # )
++        self.runner = RPCRunner(
++            device_key,
++            server_addr,
++            server_port,
++            priority,
++            n_parallel,
++            timeout,
++            number,
++            repeat,
++            min_repeat_ms,
++            cooldown_interval,
++            enable_cpu_cache_flush,
++        )
++        # Wait for the processes to start
++        time.sleep(0.5)
++
++    def __del__(self):
++        # Close the tracker and server before exit
++        # self.tracker.terminate()
++        # self.server.terminate()
++        time.sleep(0.5)
++
++
+ class MeasureErrorNo(object):
+     """Error type for MeasureResult."""
+ 
+@@ -634,6 +727,7 @@ def _local_build_worker(inp_serialized, build_func, verbose):
+         except Exception:
+             error_no = MeasureErrorNo.COMPILE_HOST
+             error_msg = make_traceback_info()
++            print(error_msg)
+     else:
+         filename = ""
+ 
+diff --git a/python/tvm/relay/backend/graph_executor_codegen.py b/python/tvm/relay/backend/graph_executor_codegen.py
+index 58717a0ab..28988c828 100644
+--- a/python/tvm/relay/backend/graph_executor_codegen.py
++++ b/python/tvm/relay/backend/graph_executor_codegen.py
+@@ -51,6 +51,7 @@ class GraphExecutorCodegen(object):
+         self._list_params_name = self._mod["list_params_name"]
+         self._get_param_by_name = self._mod["get_param_by_name"]
+         self._get_irmodule = self._mod["get_irmodule"]
++        self._get_var_tensor_map = self.mod["get_var_tensor_map"]
+         self._setup(mod, target)
+ 
+     def _setup(self, mod, target):
+@@ -93,3 +94,7 @@ class GraphExecutorCodegen(object):
+             arr.copyto(param)
+             params[key] = param
+         return graph_json, lowered_func, params
++
++    def get_var_tensor_map(self):
++        var_tensor_map = self._get_var_tensor_map()
++        return var_tensor_map
+\ No newline at end of file
+diff --git a/python/tvm/relay/backend/te_compiler.py b/python/tvm/relay/backend/te_compiler.py
+index db7504915..3e730db1a 100644
+--- a/python/tvm/relay/backend/te_compiler.py
++++ b/python/tvm/relay/backend/te_compiler.py
+@@ -172,7 +172,7 @@ def select_implementation(op, attrs, inputs, out_type, target, use_autotvm=True)
+     """
+     all_impls = get_valid_implementations(op, attrs, inputs, out_type, target)
+     best_plevel_impl = max(all_impls, key=lambda x: x.plevel)
+-
++    
+     # Disable autotvm if auto_scheduler is enabled.
+     # (i.e., always return the implementation with the highest priority for auto-scheduler).
+     if PassContext.current().config.get("relay.backend.use_auto_scheduler", False):
+diff --git a/python/tvm/relay/build_module.py b/python/tvm/relay/build_module.py
+index f1686d2a0..61797a812 100644
+--- a/python/tvm/relay/build_module.py
++++ b/python/tvm/relay/build_module.py
+@@ -20,6 +20,8 @@ from a Relay expression.
+ """
+ import warnings
+ import numpy as np
++from tvm.auto_scheduler.compute_dag import ComputeDAG
++from tvm.auto_scheduler.utils import get_const_tuple
+ 
+ from tvm.ir import IRModule
+ 
+@@ -87,6 +89,7 @@ def _convert_param_map(params):
+     return inputs
+ 
+ 
++
+ class BuildModule(object):
+     """Build an IR module to run on TVM graph executor. This class is used
+     to expose the `RelayBuildModule` APIs implemented in C++.
+@@ -101,6 +104,7 @@ class BuildModule(object):
+         self._set_params_func = self.mod["set_params"]
+         self._get_params_func = self.mod["get_params"]
+         self._get_function_metadata = self.mod["get_function_metadata"]
++        self._get_var_tensor_map = self.mod["get_var_tensor_map"]
+ 
+     def build(
+         self, mod, target=None, target_host=None, params=None, executor="graph", mod_name=None
+@@ -176,6 +180,57 @@ class BuildModule(object):
+         mod = self.get_module()
+         params = self.get_params()
+         executor_config = self.get_graph_json() if executor == "graph" else None
++        var_tensor_map = self.get_var_tensor_map()
++        
++        from tvm.auto_scheduler import search_task
++        from tvm import auto_scheduler
++        import tvm.target
++        if var_tensor_map is not None:
++            for global_var, tensor in var_tensor_map.items():
++                print("global_var {}".format(global_var))
++                for t in tensor:
++                    print(t)
++                print("print tensors done")
++                from tvm import auto_scheduler
++                @auto_scheduler.register_workload
++                def wrap_schedule_compute_func():
++                    return tensor
++                task = tvm.auto_scheduler.SearchTask(func=wrap_schedule_compute_func, target=tvm.target.cuda())
++                print("task.compute_dag start")
++                print(task.compute_dag)
++                print("task.compute_dag end")
++                log_file = "/tmp/tvm_kfusion.log"
++                import os
++                if os.path.exists(log_file):
++                    os.remove(log_file)
++                # sch, args = task.apply_best(log_file)
++                # print("Lowered TIR:")
++                # print(tvm.lower(sch, args, simple_mode=True))
++                # func = tvm.build(sch, args, target)
++                # exit(0)
++
++                nd_arrays = []
++                for t in tensor:
++                    d = np.ones(shape=get_const_tuple(t.shape), dtype=np.float32)
++                    print(d)
++                    nd = tvm.nd.array(d, device=tvm.cuda())
++                    print(nd)
++                    nd_arrays.append(nd)
++                
++                measure_ctx = auto_scheduler.LocalRPCMeasureContext(repeat=1, n_parallel=1, min_repeat_ms=300, timeout=10)
++                tuner = auto_scheduler.TaskScheduler([task])
++                tune_option = auto_scheduler.TuningOptions(
++                    num_measure_trials=5,  # change this to 20000 to achieve the best performance
++                    runner=measure_ctx.runner,
++                    measure_callbacks=[auto_scheduler.RecordToFile(log_file)])
++                tuner.tune(tune_option)
++                sch, args = task.apply_best(log_file)
++                print("Lowered TIR:")
++                print(tvm.lower(sch, args, simple_mode=True))
++                func = tvm.build(sch, args, tvm.target.cuda())
++                func(*nd_arrays)
++                print(nd_arrays[-1])
++                exit(0)
+ 
+         return executor_config, mod, params
+ 
+@@ -238,6 +293,18 @@ class BuildModule(object):
+         for key, value in params.items():
+             ret[key] = value.data
+         return ret
++    
++    def get_var_tensor_map(self):
++        """Return the var tensor map 
++        that need to be scheduled by auto_scheduler"""
++        var_tensor_map = self._get_var_tensor_map()
++        ret = {}
++        for var, array_tensor in var_tensor_map.items():
++            arr = []
++            for t in array_tensor:
++                arr.append(t)
++            ret[var] = arr
++        return ret
+ 
+ 
+ @register_func("tvm.relay.module_export_library")
+diff --git a/python/tvm/relay/op/tensor.py b/python/tvm/relay/op/tensor.py
+index e615bbf21..03ead1704 100644
+--- a/python/tvm/relay/op/tensor.py
++++ b/python/tvm/relay/op/tensor.py
+@@ -1080,6 +1080,26 @@ def fixed_point_multiply(data, multiplier, shift):
+     """
+     return _make.fixed_point_multiply(data, multiplier, shift)
+ 
++def concatenate_expand(data):
++    """Concatenate the input tensors along the given axis.
++
++    Parameters
++    ----------
++    data : Union(List[relay.Expr], Tuple[relay.Expr])
++        A list of tensors.
++    axis : int
++        The axis along which the tensors are concatenated.
++
++    Returns
++    -------
++    result: relay.Expr
++        The concatenated tensor.
++    """
++    data = list(data)
++    if not data:
++        raise ValueError("relay.concatenate_expand requires data to be non-empty.")
++    return _make.concatenate_expand(Tuple(data))
++
+ 
+ def concatenate(data, axis):
+     """Concatenate the input tensors along the given axis.
+diff --git a/python/tvm/relay/testing/__init__.py b/python/tvm/relay/testing/__init__.py
+index 9fc75199b..1449071f0 100644
+--- a/python/tvm/relay/testing/__init__.py
++++ b/python/tvm/relay/testing/__init__.py
+@@ -55,6 +55,7 @@ def run_opt_pass(expr, opt_pass, import_prelude=False):
+         Prelude(mod)
+     mod = relay.transform.InferType()(mod)
+     mod = opt_pass(mod)
++    print(mod)
+     entry = mod["main"]
+     return entry if isinstance(expr, relay.Function) else entry.body
+ 
+diff --git a/python/tvm/relay/transform/transform.py b/python/tvm/relay/transform/transform.py
+index 0dc079448..4524ded35 100644
+--- a/python/tvm/relay/transform/transform.py
++++ b/python/tvm/relay/transform/transform.py
+@@ -285,6 +285,21 @@ def FuseOps(fuse_opt_level=-1):
+     return _ffi_api.FuseOps(fuse_opt_level)
+ 
+ 
++def HorizonFuseOps(fuse_opt_level=1):
++    """Fuse operators in an expr to a larger operator according to some rules.
++
++    Parameters
++    ----------
++    
++
++    Returns
++    -------
++    ret : tvm.transform.Pass
++        The registered pass for operator fusion.
++    """
++    return _ffi_api.HorizontalFusion(fuse_opt_level)
++
++
+ def DefuseOps():
+     """The inverse operation of FuseOps. It transforms a fused program returned by FuseOps into the
+     program before FuseOps. (i.e., x == DefuseOps(FuseOps(x)))
+diff --git a/python/tvm/topi/arm_cpu/injective.py b/python/tvm/topi/arm_cpu/injective.py
+index 330144b33..270292a17 100644
+--- a/python/tvm/topi/arm_cpu/injective.py
++++ b/python/tvm/topi/arm_cpu/injective.py
+@@ -77,6 +77,35 @@ def schedule_injective(outs):
+     return s
+ 
+ 
++def schedule_concatenate_expand(outs):
++    """Schedule for concatenate op.
++
++    Parameters
++    ----------
++    outs: Array of Tensor
++          The computation graph description of concatenate in the format
++          of an array of tensors.
++
++    Returns
++    -------
++    sch: Schedule
++        The computation schedule for the op.
++    """
++    outs = [outs] if isinstance(outs, te.tensor.Tensor) else outs
++    s = te.create_schedule([x.op for x in outs])
++    x = outs[0]
++    tvm.te.schedule.AutoInlineInjective(s)
++    if len(s[x].op.axis) >= 4:
++        fused = s[x].fuse(s[x].op.axis[0], s[x].op.axis[1], s[x].op.axis[2])
++        s[x].parallel(fused)
++    elif len(s[x].op.axis) >= 3:
++        fused = s[x].fuse(s[x].op.axis[0], s[x].op.axis[1])
++        s[x].parallel(fused)
++    elif len(s[x].op.axis) >= 2:
++        s[x].parallel(s[x].op.axis[0])
++    return s
++
++
+ def schedule_concatenate(outs):
+     """Schedule for concatenate op.
+ 
+diff --git a/python/tvm/topi/cuda/__init__.py b/python/tvm/topi/cuda/__init__.py
+index 88d306761..97d472286 100644
+--- a/python/tvm/topi/cuda/__init__.py
++++ b/python/tvm/topi/cuda/__init__.py
+@@ -60,3 +60,4 @@ from .sparse_reshape import *
+ from .transform import *
+ from .unique import *
+ from .searchsorted import *
++from .tensor_intrin import *
+\ No newline at end of file
+diff --git a/python/tvm/topi/cuda/conv2d.py b/python/tvm/topi/cuda/conv2d.py
+index bd8d7ec19..79b8d7162 100644
+--- a/python/tvm/topi/cuda/conv2d.py
++++ b/python/tvm/topi/cuda/conv2d.py
+@@ -41,6 +41,7 @@ def schedule_conv2d_nchw(cfg, outs):
+ 
+     def _callback(op):
+         if op.tag == "conv2d_nchw":
++            print("python/tvm/topi/cuda/conv2d.py:44 {}".format(op))
+             schedule_direct_cuda(cfg, s, op.output(0))
+ 
+     traverse_inline(s, outs[0].op, _callback)
+diff --git a/python/tvm/topi/cuda/conv2d_direct.py b/python/tvm/topi/cuda/conv2d_direct.py
+index 2dc6635e6..80938acd3 100644
+--- a/python/tvm/topi/cuda/conv2d_direct.py
++++ b/python/tvm/topi/cuda/conv2d_direct.py
+@@ -24,7 +24,7 @@ from ..utils import get_const_tuple
+ 
+ def schedule_direct_cuda(cfg, s, conv):
+     """schedule optimized for batch size = 1"""
+-
++    print("schedule optimized for batch size = 1")
+     ##### space definition begin #####
+     n, f, y, x = s[conv].op.axis
+     rc, ry, rx = s[conv].op.reduce_axis
+diff --git a/python/tvm/topi/transform.py b/python/tvm/topi/transform.py
+index 006a6e785..50b55d147 100644
+--- a/python/tvm/topi/transform.py
++++ b/python/tvm/topi/transform.py
+@@ -349,6 +349,21 @@ def squeeze(a, axis=None):
+     return cpp.squeeze(a, axis)
+ 
+ 
++def concatenate_expand(a_tuple):
++    """Join a sequence of arrays along 0 axis and reshape to (num_tuple, *tuple_0_shape).
++
++    Parameters
++    ----------
++    a_tuple : tuple of tvm.te.Tensor
++        The arrays to concatenate
++
++    Returns
++    -------
++    ret : tvm.te.Tensor
++    """
++    return cpp.concatenate_expand(a_tuple)
++
++
+ def concatenate(a_tuple, axis=0):
+     """Join a sequence of arrays along an existing axis.
+ 
+diff --git a/python/tvm/topi/utils.py b/python/tvm/topi/utils.py
+index be3df2be5..0fe1da6dc 100644
+--- a/python/tvm/topi/utils.py
++++ b/python/tvm/topi/utils.py
+@@ -66,15 +66,18 @@ def traverse_inline(s, final_op, callback):
+     visited = set()
+ 
+     def _traverse(op):
++        print("python/tvm/topi/utils.py/traverse_inline:69 {}".format(op))
+         if op in visited:
+             return
+         visited.add(op)
+         if tag.is_injective(op.tag):
+             if op not in s.outputs:
+                 s[op].compute_inline()
++                print("python/tvm/topi/utils.py/traverse_inline:76 {}".format(op))
+             for tensor in op.input_tensors:
+                 if isinstance(tensor.op, tvm.te.ComputeOp):
+                     _traverse(tensor.op)
++        print("python/tvm/topi/utils.py/traverse_inline:80 callback {}".format(op))
+         callback(op)
+ 
+     _traverse(final_op)
+diff --git a/python/tvm/topi/x86/injective.py b/python/tvm/topi/x86/injective.py
+index 6492b78d6..b2e167953 100644
+--- a/python/tvm/topi/x86/injective.py
++++ b/python/tvm/topi/x86/injective.py
+@@ -83,6 +83,55 @@ def schedule_injective(outs):
+     return s
+ 
+ 
++def schedule_concatenate_expand(outs):
++    """X86 schedule for concatenate op.
++
++    Parameters
++    ----------
++    outs: Array of Tensor
++          The computation graph description of injective in the format
++          of an array of tensors.
++
++    Returns
++    -------
++    sch: Schedule
++        The computation schedule for the op.
++    """
++
++    def vectorize(sch, tensor, vectorize_limit):
++        """Internal vectorization function for concatenate."""
++        inner_axis = s[tensor].op.axis[len(s[tensor].op.axis) - 1]
++        # Check that the tensor shape is static. Otherwise skip vectorization.
++        if isinstance(tensor.shape[len(tensor.shape) - 1], IntImm):
++            inner_length = tensor.shape[len(tensor.shape) - 1].value
++            if inner_length <= vectorize_limit:
++                sch[tensor].vectorize(inner_axis)
++            else:
++                split_factor = 1
++                for i in range(vectorize_limit, 1, -1):
++                    if inner_length % i == 0:
++                        split_factor = i
++                        break
++                if split_factor > 1:
++                    _, inner_i = sch[tensor].split(inner_axis, split_factor)
++                    sch[tensor].vectorize(inner_i)
++
++    outs = [outs] if isinstance(outs, te.tensor.Tensor) else outs
++    x = outs[0]
++    s = te.create_schedule([x.op for x in outs])
++    te.schedule.AutoInlineInjective(s)
++    if len(s[x].op.axis) >= 5:
++        fused = s[x].fuse(s[x].op.axis[0], s[x].op.axis[1], s[x].op.axis[2])
++        vectorize(s, x, 64)
++        s[x].parallel(fused)
++    elif len(s[x].op.axis) >= 3:
++        fused = s[x].fuse(s[x].op.axis[0], s[x].op.axis[1])
++        s[x].parallel(fused)
++    else:
++        s[x].parallel(s[x].op.axis[0])
++    return s
++
++
+ def schedule_concatenate(outs):
+     """X86 schedule for concatenate op.
+ 
+diff --git a/src/auto_scheduler/feature.cc b/src/auto_scheduler/feature.cc
+index aaf7d48b1..173e4ebf1 100755
+--- a/src/auto_scheduler/feature.cc
++++ b/src/auto_scheduler/feature.cc
+@@ -1272,10 +1272,17 @@ void GetPerStoreFeaturesWorkerFunc(const SearchTask& task, const State& state, i
+   try {
+     const std::string& name = "main";
+     auto pass_ctx = tvm::transform::PassContext::Current();
+-
++    // Verify that copy ObjectRef will not change data
++    // for(auto t: tensors){
++    //   VLOG(1) << t <<" hash: " << ObjectPtrHash()(t);
++    // }
++    // auto test_array_copy_tensor = Array<ObjectRef>{tensors.begin(), tensors.end()};
++    // for(auto t: test_array_copy_tensor){
++    //   VLOG(1) << t <<" hash: " << ObjectPtrHash()(t);
++    // }
+     auto mod = ScheduleToModule(sch, Array<ObjectRef>{tensors.begin(), tensors.end()}, name,
+                                 std::unordered_map<te::Tensor, te::Buffer>());
+-
++    
+     bool disable_vectorize =
+         pass_ctx->GetConfig<Bool>("tir.disable_vectorize", Bool(false)).value();
+     bool instrument_bound_checkers =
+diff --git a/src/auto_scheduler/measure.cc b/src/auto_scheduler/measure.cc
+index c3212f2b4..d5f18002d 100755
+--- a/src/auto_scheduler/measure.cc
++++ b/src/auto_scheduler/measure.cc
+@@ -317,7 +317,7 @@ void ProgramMeasurerNode::SilentMeasure(const SearchTask& task, const Array<Meas
+   // Call builder and runner
+   Array<BuildResult> build_res_batch = builder->Build(inputs, verbose);
+   Array<MeasureResult> result_batch = runner->Run(inputs, build_res_batch, verbose);
+-
++  
+   // Store result batch
+   for (auto& res : result_batch) {
+     results->push_back(res);
+diff --git a/src/driver/driver_api.cc b/src/driver/driver_api.cc
+index 8f9c8589e..4829dc23c 100644
+--- a/src/driver/driver_api.cc
++++ b/src/driver/driver_api.cc
+@@ -34,6 +34,8 @@
+ #include <mutex>
+ #include <stack>
+ 
++#include "../tir/transforms/replace_tensors_in_expr_stmt.h"
++
+ namespace tvm {
+ 
+ // Register build pipeline related options
+@@ -111,6 +113,7 @@ void GetBinds(const Array<ObjectRef>& args, bool compact,
+     if (const te::TensorNode* tensor_node = x.as<te::TensorNode>()) {
+       te::Tensor x_ref = GetRef<te::Tensor>(tensor_node);
+       if (out_binds->find(x_ref) == out_binds->end()) {
++        VLOG(2) << "Create for " << x_ref << " hash: "<< ObjectPtrHash()(x_ref);
+         tir::Buffer buf =
+             BufferWithOffsetAlignment(x_ref->shape, x_ref->dtype, x_ref->op->name, -1, 0, compact);
+         out_binds->Set(x_ref, buf);
+@@ -288,25 +291,88 @@ IRModule ApplyPasses(IRModule mod, transform::Sequential seq) {
+   return mod;
+ }
+ 
++bool ShapeEqual(Array<PrimExpr> s1, Array<PrimExpr> s2){
++  if(s1.size() != s2.size()){
++    return false;
++  }
++  for(size_t i=0; i< s1.size(); ++i){
++    if(Downcast<IntImm>(s1[i])->value != Downcast<IntImm>(s2[i])->value){
++      return false;
++    }
++  }
++  return true;
++}
++
++bool ShapeEqual(te::Tensor t1, te::Tensor t2){
++  return ShapeEqual(t1->shape, t2->shape);
++}
++
++
+ // Convert te schedule to IRModule
+ IRModule ScheduleToModule(te::Schedule sch, const Array<ObjectRef>& args, const std::string& name,
+                           const std::unordered_map<te::Tensor, tir::Buffer>& binds) {
+   sch = sch.normalize();
+-
++  
++  for(auto& stage: sch->stages){
++    VLOG(0) << stage;
++    for(auto& iv: stage->all_iter_vars){
++      VLOG(0) << iv;
++    }
++    for(auto& lv: stage->leaf_iter_vars){
++      VLOG(0) << lv;
++    }
++    VLOG(0) << stage->attach_ivar;
++    for(auto& relation: stage->relations){
++      VLOG(0) << relation;
++    }
++    for(auto& bind: stage->iter_var_attrs){
++      VLOG(0) << bind.first << " bind to " << bind.second;
++    }
++  }
+   transform::PassContext pass_ctx = transform::PassContext::Current();
+   bool debug_keep_trivial_loop =
+       pass_ctx->GetConfig<Bool>("tir.debug_keep_trivial_loop", Bool(false)).value();
+ 
+   // Before TIR transformation.
+   tir::Stmt stmt = te::ScheduleOps(sch, te::InferBound(sch), debug_keep_trivial_loop);
++  VLOG(2) << "ScheduleOps to stmt: " << stmt;
+   bool compact = te::VerifyCompactBuffer(stmt);
+ 
++  // TODO(Chunwei xia) Just for jump the bug, remove when find why
++  // Only replace tensors in arg_tensor that does not occur in used_tensor_set
++  auto used_tensor_set = tvm::tir::transforms::FGetTensorsFromStmtExpr(stmt);
++  std::unordered_map<te::Tensor, te::Tensor> replace_map;
++  Array<te::Tensor> arg_tensor_not_in_stmt;
++  for(auto& arg_tensor: args){
++    auto tensor = Downcast<te::Tensor>(arg_tensor);
++    if(!used_tensor_set.count(tensor)){
++      arg_tensor_not_in_stmt.push_back(tensor);
++    }
++  }
++  for(auto& arg_tensor: arg_tensor_not_in_stmt){
++    for(auto& used_tensor: used_tensor_set){
++      auto placeholder_op = (Downcast<te::Tensor>(arg_tensor)->op).as<te::PlaceholderOpNode>();
++      if(ShapeEqual(used_tensor, Downcast<te::Tensor>(arg_tensor)) && placeholder_op){
++        VLOG(1) << used_tensor << " hash: " << ObjectPtrHash()(used_tensor) << " arg_tensor " << arg_tensor << ObjectPtrHash()(arg_tensor);
++        replace_map.insert({used_tensor, Downcast<te::Tensor>(arg_tensor)});
++      }
++    }
++  }
++  stmt = tvm::tir::transforms::FReplaceDataProducer(stmt, replace_map);
++  
+   Map<te::Tensor, tir::Buffer> out_binds;
+   Array<ObjectRef> out_arg_list;
+   GetBinds(args, compact, binds, &out_binds, &out_arg_list);
+-
++  
++  for(auto& ele: out_binds){
++    VLOG(1) << ele.first << " hash: " << ObjectPtrHash()(ele.first) << " -> " << ele.second;
++  }
++  for(auto& ele: out_arg_list){
++    VLOG(1) << ele;
++  }
+   // Build the function, converting from te::Tensor to tir::Buffer
+   tir::PrimFunc f = te::SchedulePostProcToPrimFunc(out_arg_list, std::move(stmt), out_binds);
++  VLOG(2) << "PrimFunc: " << f;
+   f = WithAttr(std::move(f), "global_symbol", runtime::String(name));
+ 
+   // Mark this schedule as being converted from an TE schedule. Makes sure that
+diff --git a/src/ir/module.cc b/src/ir/module.cc
+index 3deb70dd7..a1837aa37 100644
+--- a/src/ir/module.cc
++++ b/src/ir/module.cc
+@@ -188,7 +188,7 @@ void WarnIfMalformed(const IRModule& mod, relay::Function func) {
+   auto ftv = relay::FreeTypeVars(func, mod);
+   // TODO(@jroesch): refactor to use diagnostic context
+   ICHECK_EQ(fv.size(), 0) << "There are free variables: " << fv << std::endl;
+-  ICHECK_EQ(ftv.size(), 0) << "There are free type variables: " << fv
++  ICHECK_EQ(ftv.size(), 0) << "There are free type variables: " << ftv
+                            << " in function: " << AsText(func, false);
+ }
+ 
+diff --git a/src/ir/transform.cc b/src/ir/transform.cc
+index 0e42b3534..204a45df4 100644
+--- a/src/ir/transform.cc
++++ b/src/ir/transform.cc
+@@ -410,7 +410,7 @@ IRModule ModulePassNode::operator()(IRModule mod, const PassContext& pass_ctx) c
+   ICHECK(mod.defined()) << "The input module must be set.";
+ 
+   VLOG_CONTEXT << pass_info->name;
+-  VLOG(0) << "Executing module pass with opt level: " << pass_info->opt_level;
++  // VLOG(0) << "Executing module pass with opt level: " << pass_info->opt_level;
+   VLOG(1) << "Input module:" << std::endl << PrettyPrint(mod);
+ 
+   mod = pass_func(std::move(mod), pass_ctx);
+diff --git a/src/relay/backend/build_module.cc b/src/relay/backend/build_module.cc
+index 7005e94c2..e298cf959 100644
+--- a/src/relay/backend/build_module.cc
++++ b/src/relay/backend/build_module.cc
+@@ -35,6 +35,7 @@
+ #include "../../target/source/codegen_source_base.h"
+ #include "te_compiler.h"
+ #include "utils.h"
++#include "tir_attr_metadata_visitor.h"
+ 
+ namespace tvm {
+ namespace relay {
+@@ -97,6 +98,14 @@ struct ExecutorCodegen {
+   }
+ 
+   runtime::Metadata GetMetadata() { return CallFunc<runtime::Metadata>("get_metadata"); }
++
++  Map<GlobalVar, Array<te::Tensor>> GetVarTensorMap() {
++    auto result = CallFunc<Map<GlobalVar, Array<te::Tensor>>>("get_var_tensor_map", nullptr);
++    VLOG(2) << "auto result = CallFunc<Map<GlobalVar, Array<te::Tensor>>>(\"get_var_tensor_map\", nullptr)";
++    PrintVarTensorMap(result);
++    return result;
++  }
++
+   virtual ~ExecutorCodegen() {}
+ 
+  protected:
+@@ -210,6 +219,10 @@ class RelayBuildModule : public runtime::ModuleNode {
+         ICHECK_EQ(args.num_args, 2);
+         *rv = this->Optimize(args[0], args[1], this->params_);
+       });
++    } else if (name == "get_var_tensor_map") {
++      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
++        *rv = this->executor_codegen_->GetVarTensorMap();
++      });
+     } else {
+       LOG(FATAL) << "Unknown packed function: " << name;
+       return PackedFunc([sptr_to_self, name](TVMArgs args, TVMRetValue* rv) {});
+@@ -372,7 +385,10 @@ class RelayBuildModule : public runtime::ModuleNode {
+     // hetrogenous execution.
+     pass_seqs.push_back(transform::PlanDevices(default_device_type));
+ 
++    // Horizontal fusion
++    // pass_seqs.push_back(transform::HorizontalFusion(4));
+     // Fuse the operations if it is needed.
++    
+     pass_seqs.push_back(transform::FuseOps());
+ 
+     // Create a sequential pass and perform optimizations.
+@@ -399,7 +415,9 @@ class RelayBuildModule : public runtime::ModuleNode {
+         relay_module = transform::FuseOps()(relay_module);
+       }
+     }
+-
++    relay_module = transform::InferType()(relay_module);
++    // relay_module = transform::HorizontalFusion(3)(relay_module);
++    
+     relay_module = transform::InferType()(relay_module);
+ 
+     // Inline the functions that have been lifted by the module scope.
+@@ -462,6 +480,15 @@ class RelayBuildModule : public runtime::ModuleNode {
+ 
+     auto lowered_funcs = executor_codegen_->GetIRModule();
+ 
++    // Get output_tensors from FunctionMetaData
++    auto function_metadata = executor_codegen_->GetFunctionMetadata();
++    for(auto ele: function_metadata){
++      VLOG(2) << ele.first << ele.second;
++    }
++    if(function_metadata.count(std::string("kFusion"))){
++      VLOG(2) << "kFusion:" << function_metadata[std::string("kFusion")];
++    }
++
+     // No need to build for external functions.
+     Target ext_dev("ext_dev");
+     if (lowered_funcs.find(ext_dev) != lowered_funcs.end()) {
+diff --git a/src/relay/backend/graph_executor_codegen.cc b/src/relay/backend/graph_executor_codegen.cc
+index debd66912..c9faa0674 100644
+--- a/src/relay/backend/graph_executor_codegen.cc
++++ b/src/relay/backend/graph_executor_codegen.cc
+@@ -40,6 +40,7 @@
+ #include "../transforms/device_aware_visitors.h"
+ #include "./te_compiler.h"
+ #include "./utils.h"
++#include "tir_attr_metadata_visitor.h"
+ 
+ namespace tvm {
+ namespace relay {
+@@ -280,6 +281,7 @@ class GraphExecutorCodegen : public backend::MemoizedExprTranslator<std::vector<
+     // This is the point where we separate the functions in the module by target
+     ret.lowered_funcs = tec::GetPerTargetModules(lowered_mod);
+     ret.external_mods = external_modules.value();
++    ret.var_tensor_map = GetPerVarTensorsFromIRModule(lowered_mod);
+     return ret;
+   }
+ 
+@@ -634,6 +636,15 @@ class GraphExecutorCodegenModule : public runtime::ModuleNode {
+         Function func = args[0];
+         String mod_name = args[1];
+         this->output_ = this->codegen_->Codegen(func, mod_name);
++        // Get kFusion output tensors
++        for(auto ele: this->output_.var_tensor_map) {
++          std::stringstream os;
++          os << "Var: " << ele.first << " Tensors: ";
++          for(auto t: ele.second) {
++            os << t;
++          }
++          VLOG(2) << os.str();
++        }
+       });
+     } else if (name == "get_graph_json") {
+       return PackedFunc(
+@@ -675,6 +686,12 @@ class GraphExecutorCodegenModule : public runtime::ModuleNode {
+       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+         *rv = this->output_.function_metadata;
+       });
++    } else if (name == "get_var_tensor_map") {
++      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
++        *rv = this->output_.var_tensor_map;
++        VLOG(2) << "*rv = this->output_.var_tensor_map";
++        PrintVarTensorMap(this->output_.var_tensor_map);
++      });
+     } else {
+       return PackedFunc([](TVMArgs args, TVMRetValue* rv) {});
+     }
+diff --git a/src/relay/backend/te_compiler.cc b/src/relay/backend/te_compiler.cc
+index a8c27a126..3720460b3 100644
+--- a/src/relay/backend/te_compiler.cc
++++ b/src/relay/backend/te_compiler.cc
+@@ -46,6 +46,7 @@
+ #include "../transforms/device_aware_visitors.h"
+ #include "./te_compiler_cache.h"
+ #include "./utils.h"
++#include "tir_attr_metadata_visitor.h"
+ 
+ namespace tvm {
+ namespace relay {
+@@ -244,6 +245,14 @@ class TECompilerImpl : public TECompilerNode {
+       }
+     }
+ 
++    if (cfunc->need_auto_scheduler != 0) {
++      auto new_cfunc = CachedFunc(key->target, cfunc->prim_fn_var, cfunc->inputs, 
++      cfunc->outputs, cfunc->schedule, cfunc->shape_func_param_states, cfunc->funcs);
++      new_cfunc->need_auto_scheduler = cfunc->need_auto_scheduler;
++      value->cached_func = new_cfunc;
++      return value;
++    }
++
+     // NOTE: array will copy on write.
+     Array<te::Tensor> all_args = Array<te::Tensor>(cfunc->inputs);
+     for (te::Tensor arg : cfunc->outputs) {
+@@ -492,6 +501,7 @@ class LowerTensorExprMutator : public DeviceAwareExprMutator {
+       prim_fns.Set(prim_fn.first, Downcast<tir::PrimFunc>(prim_fn.second));
+       all_prim_fn_vars.push_back(prim_fn.first);
+       VLOG(1) << "lowered primitive includes bindings for '" << PrettyPrint(prim_fn.first) << "'";
++      VLOG(1) << "lowerd tir::PrimFunc is " << PrettyPrint(prim_fn.second);
+     }
+ 
+     // TODO(@areusch, @jroesch): this metadata is for AOT, this should be our interface for AOT
+@@ -499,16 +509,35 @@ class LowerTensorExprMutator : public DeviceAwareExprMutator {
+     func_with_metadata = WithAttr(func_with_metadata, "prim_fn_var", lowered_func->prim_fn_var);
+     func_with_metadata = WithAttr(func_with_metadata, "prim_funcs", prim_fns);
+     func_with_metadata = WithAttr(func_with_metadata, tvm::attr::kTarget, lowered_func->target);
+-
++    
++    
+     // Provide a callback hook which allows one-level up code generators to
+     // act when we process a function.
+-    this->process_fn_(func_with_metadata);
++    if(lowered_func->need_auto_scheduler == 0){
++      this->process_fn_(func_with_metadata);
++    }
+ 
+     auto tir_call_attrs = make_object<TIRCallAttrs>();
+     if (func->HasNonzeroAttr(attr::kReshapeOnly)) {
+       tir_call_attrs->metadata.Set(attr::kReshapeOnly, tvm::Integer(1));
+     }
+ 
++    if(lowered_func->need_auto_scheduler){
++      VLOG(2) << "lowered_func->need_auto_scheduler" << lowered_func->need_auto_scheduler;
++      // By default in the io_tensors the input tensors is pushed before output tensors
++      for(auto t: lowered_func->inputs){
++        VLOG(2) << "Input tensors: " << t;
++      }for(auto t: lowered_func->outputs){
++        VLOG(2) << "Output tensors: " << t;
++      }
++      Array<te::Tensor> io_tensors(lowered_func->inputs);
++      for(auto output_tensor: lowered_func->outputs){
++        io_tensors.push_back(output_tensor);
++      }
++      tir_call_attrs->metadata.Set("output_tensors", io_tensors);
++      tir_call_attrs->metadata.Set("kFusion", tvm::PrimExpr(1));
++    }
++
+     auto device_copy = IsDeviceCopy(func);
+     if (std::get<0>(device_copy)) {
+       // Record that device copy source and destination devices so the device planner can
+@@ -617,7 +646,12 @@ class LowerTensorExprMutator : public DeviceAwareExprMutator {
+     for (const auto& arg : call_node->args) {
+       args.push_back(VisitExpr(arg));
+     }
+-
++    // Check whether the kFusion attr is set
++    auto tir_call_attr = pair.second.as<TIRCallAttrs>();
++    if(tir_call_attr->metadata.count(std::string("kFusion"))){
++      VLOG(2) << tir_call_attr->metadata["kFusion"];
++    }
++    
+     // Replace with direct call to lowered primitive, and attach annotations to record calling
+     // convention.
+     return Call(pair.first, args, pair.second);
+@@ -902,6 +936,16 @@ IRModule LowerTE(const IRModule& module, TargetMap targets, const String& module
+ 
+   auto updated_module = LowerTensorExpr(targets, module_name, compiler, process_fn)(module);
+ 
++  // Get kFusion output_tensors
++  for(auto ele: updated_module->functions){
++    VLOG(2) << ele.first << ele.second;
++    auto output_tensors = GetOutputTensorsFromRelayFunc(ele.second);
++    VLOG(2) << "GetOutputTensorsFromRelayFunc:";
++    for(auto t: output_tensors){
++      VLOG(2) << t;
++    }
++  }
++
+   backend::UpdateAutoSchedulerOpWeights(compiler);
+ 
+   // Copy the lowered functions into the return module
+@@ -923,7 +967,6 @@ Map<Target, IRModule> GetPerTargetModules(IRModule mod) {
+       // Extract target
+       Optional<Target> target = func->GetAttr<Target>(tvm::attr::kTarget);
+       ICHECK(target) << "Target should be set at this point";
+-
+       // Put the function in per_target_modules
+       if (!per_target_modules.count(target.value())) {
+         // Initialize the IRModule for this target with the attributes from the input IRModule
+@@ -936,7 +979,13 @@ Map<Target, IRModule> GetPerTargetModules(IRModule mod) {
+         IRModule target_module = per_target_modules.at(target.value());
+         target_module->Add(var, func);
+       }
+-    } else if (!func->IsInstance<relay::FunctionNode>()) {
++    } else if (func->IsInstance<relay::FunctionNode>()) {
++      auto output_tensors = GetOutputTensorsFromRelayFunc(func);
++      VLOG(2) << "GetOutputTensorsFromRelayFunc:";
++      for(auto t: output_tensors){
++        VLOG(2) << t;
++      }
++    } else {
+       LOG(FATAL)
+           << "The function types in the IRModule should be RelayFunction or PrimFunc, but got "
+           << func->GetTypeKey();
+diff --git a/src/relay/backend/te_compiler_cache.cc b/src/relay/backend/te_compiler_cache.cc
+index be5b172e6..3affed6f9 100644
+--- a/src/relay/backend/te_compiler_cache.cc
++++ b/src/relay/backend/te_compiler_cache.cc
+@@ -33,6 +33,8 @@
+ #include <tvm/te/schedule.h>
+ #include <tvm/te/schedule_pass.h>
+ #include <tvm/topi/tags.h>
++#include <tvm/auto_scheduler/search_task.h>
++#include <tvm/auto_scheduler/auto_schedule.h>
+ 
+ #include <functional>
+ #include <limits>
+@@ -40,10 +42,16 @@
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
++#include <set>
+ 
+ #include "../op/memory/memory.h"
+ #include "../transforms/pass_utils.h"
++#include "../transforms/prim_expr_printer.h"
++#include "../transforms/prim_func_fusion_rewrite.h"
++#include "../transforms/fuse_tensor_expression.h"
++#include "../../tir/transforms/replace_tensors_in_expr_stmt.h"
+ #include "utils.h"
++// #include <../../auto_scheduler/search_policy/sketch_policy.h>
+ 
+ namespace tvm {
+ namespace relay {
+@@ -108,13 +116,67 @@ Array<IndexExpr> GetShape(const Array<IndexExpr>& shape) {
+   return res;
+ }
+ 
++// void PrintPrimExpr(const PrimExpr& expr){
++//   std::ostringstream os;
++//   if(expr.as<tir::MaxNode>()){
++//       auto max_ir = expr.as<tir::MaxNode>();
++//       os << "tir.max(" << max_ir->a << ", " << max_ir->b << ")";
++//     }else if(expr.as<tir::ReduceNode>()){
++//       auto reduce_ir = expr.as<tir::ReduceNode>();
++//       os << "tir.reduce(";
++//       for(const auto& var: reduce_ir->axis) {
++//         os << " rvar " << var;
++//       } os << " source: " << reduce_ir->source << ", combiner: " << reduce_ir->combiner << ", condition " 
++//         << reduce_ir->condition << ", value_index: " << reduce_ir->value_index << ")";
++//       for(auto& expr: reduce_ir->source){
++//         PrintPrimExpr(expr);
++//       }
++//     }else if(expr.as<tir::AddNode>()){
++//       auto add_ir = expr.as<tir::AddNode>();
++//       os << "tir.add(" << add_ir->a << ", " << add_ir->b << ")";
++//     }else if(expr.as<tir::MulNode>()){
++//       auto mul_ir = expr.as<tir::MulNode>();
++//       os << "tir.mul(" << mul_ir->a << ", " << mul_ir->b << ")";
++//     }else if(expr.as<tir::CommReducerNode>()){
++//       auto comm_reduce_ir = expr.as<tir::CommReducerNode>();
++//       os << "tir.CommReduce(" << comm_reduce_ir->lhs << ", " << comm_reduce_ir->rhs << ")";
++//     }
++//     LOG(INFO) << os.str();
++// }
++
++
++void PrintTensor(const te::Tensor& tensor){
++  auto op_name = tensor->op->name;
++  std::ostringstream os;
++  os << "name: " << op_name << ", shape: [";
++  for(auto s: tensor->shape){
++    os << s <<",";
++  }os <<"]";
++  
++  tvm::Array<te::IterVar> iter_vars = tensor->op->root_iter_vars();
++  if(tensor->op.as<te::ComputeOpNode>()){
++    os << " ComputeOp: ";
++    for(const auto& var: iter_vars) {
++      os << " " << var;
++    }
++    LOG(INFO) << os.str();
++    for(auto &expr: tensor->op.as<te::ComputeOpNode>()->body){
++      tvm::relay::PrintPrimExpr(expr);
++    }
++    LOG(INFO) << "ComputeOp compute: " << tensor->op;
++  }
++}
++
++
++
+ // Construct a schedule for a given Relay primitive function and target.
+ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>> {
+  public:
+   explicit ScheduleBuilder(Target target, bool create_schedule = true)
+       : target_(target),
+         device_copy_op_(Op::Get("device_copy")),
+-        create_schedule_(create_schedule) {
++        create_schedule_(create_schedule),
++        schedule_fusion_(false) {
+     // Whether to use auto_scheduler schedule.
+     use_auto_scheduler_ = backend::IsAutoSchedulerEnabled();
+   }
+@@ -127,11 +189,20 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+         tvm::te::Tensor tensor = tvm::te::placeholder(GetShape(ttype->shape), ttype->dtype);
+         fn_inputs.push_back(tensor);
+         inputs.push_back(tensor);
++        VLOG(2) << tensor << " hash: " << ObjectPtrHash()(tensor);
+       }
++      this->expr_te_map_.insert({param, inputs});
+       memo_[param] = inputs;
+     }
++    LOG(INFO) <<"CreateFor " << prim_func << " body " << prim_func->body << "\n";
+     readable_name_stream_ << "fused";
++    this->schedule_fusion_ = prim_func->HasNonzeroAttr(attr::kFusion);
+     auto outputs = this->VisitExpr(prim_func->body);
++
++    VLOG(2) << "PrintTEGraph: # of outputs: " << outputs.size();
++    for(auto output_tensor: outputs){
++      PrintTEGraph(output_tensor);
++    }
+     auto candidate_name = readable_name_stream_.str();
+     constexpr static size_t kMaxFuncNameLength = 80;
+     // WARNING: Please make sure to also update TVM_CRT_MAX_STRLEN_FUNCTION_NAME
+@@ -162,7 +233,91 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+         tensor_outs.push_back(tensor);
+       }
+     }
+-
++    // std::unordered_set<const te::OperationNode, ObjectPtrHash, ObjectPtrEqual> visited;
++    std::unordered_set<te::Operation, ObjectHash, ObjectEqual> visited;
++    std::unordered_set<te::Tensor, ObjectHash, ObjectEqual> visited_tensor;
++    std::unordered_set<te::Tensor, ObjectHash, ObjectEqual> input_placeholders;
++    std::function<void(const te::Tensor&, std::unordered_set<te::Tensor, ObjectHash, ObjectEqual>&)> 
++      fvisit_tensor = [&](const te::Tensor& tensor, std::unordered_set<te::Tensor, ObjectHash, ObjectEqual>& input_placeholders){
++      // PrintTensor(tensor);
++      VLOG(2) << tensor->op;
++      visited.insert(tensor->op);
++      visited_tensor.insert(tensor);
++      if(tensor->op.as<te::PlaceholderOpNode>()){
++        input_placeholders.insert(tensor);
++      }else if(tensor->op.as<te::ComputeOpNode>()){
++        for(const te::Tensor& input_tensor: tensor->op->InputTensors()){
++          if(!visited.count(input_tensor->op) && !visited_tensor.count(input_tensor)){
++            fvisit_tensor(input_tensor, input_placeholders);
++          }
++        }
++      }
++    };
++
++    // for(auto output_tensor: outputs){
++    //   fvisit_tensor(output_tensor, input_placeholders);
++    // }
++    Array<te::Tensor> new_output_tensors;
++    // Modify the ComputeOp associated with tensors
++    if(prim_func->HasNonzeroAttr(attr::kFusion)){
++      // LOG(INFO) << "prim_func->HasNonzeroAttr(attr::kFusion)" << prim_func;
++      // auto prim_func_tensor_pair = RewriteFusedPrimFunc(prim_func, this->expr_te_map_, this->te_expr_map_, 2);
++      const auto var_expr_map = prim_func->GetAttr<Map<Expr, Expr>>("var_constant_map");
++      ICHECK(var_expr_map.defined());
++      std::unordered_map<te::Tensor, Expr, ObjectPtrHash, ObjectPtrEqual> input_tensor_constant_map;
++      // Get Var to placeholder mapping
++      for(auto outter_ele: var_expr_map.value()){
++        for(auto inner_ele: this->expr_te_map_) {
++          if(inner_ele.first.as<VarNode>()){
++            if(Downcast<Var>(outter_ele.first)->name_hint() == Downcast<Var>(inner_ele.first)->name_hint()){
++              ICHECK(inner_ele.second.size() == 1);
++              input_tensor_constant_map.insert({inner_ele.second[0], outter_ele.second});
++              VLOG(2) << "Var: " << Downcast<Var>(inner_ele.first) << " " 
++                << inner_ele.second[0]->op << " " << outter_ele.second;
++            }
++          }
++        }
++      }
++      
++      new_output_tensors = tvm::relay::transform::FFusionTensorExpression(outputs, input_tensor_constant_map);
++      for(auto& t: new_output_tensors){
++        PrintTEGraph(t);
++      }
++      // Get new input placeholders after rewrite
++      Array<te::Tensor> new_fn_input_tensors;
++      input_placeholders.clear();
++      for(auto output_tensor: new_output_tensors){
++        fvisit_tensor(output_tensor, input_placeholders);
++      }
++      VLOG(2) << "num of input placeholders: " << input_placeholders.size() ;
++      for(auto input_tensor: input_placeholders){
++        new_fn_input_tensors.push_back(input_tensor);
++      }
++      // VLOG(2) << "RewriteFusedPrimFunc: " << prim_func_tensor_pair.first;
++      // new_output_tensors = prim_func_tensor_pair.second;
++      // for(auto output_tensor: prim_func_tensor_pair.second){
++      //   PrintTEGraph(output_tensor);
++      // }
++      tvm::tir::transforms::FVerifyTensorConnect(new_output_tensors[0]);
++      // Use auto schedule
++      for(auto t: new_fn_input_tensors){
++        VLOG(2) << t << " hash: " << ObjectPtrHash()(t);
++      }
++      for(auto t: new_output_tensors){
++        VLOG(2) << t << " hash: " << ObjectPtrHash()(t);
++      }
++      Array<te::Operation> ops;
++      for(auto output_tensor: new_output_tensors){
++        ops.push_back(output_tensor->op);
++      }
++      // te::Schedule schedule = te::create_schedule(ops);
++      te::Schedule schedule;
++      // ICHECK(schedule.defined());
++      auto cached_func = CachedFunc(target_, prim_fn_var, new_fn_input_tensors, new_output_tensors, schedule, {});
++      cached_func.as<CachedFuncNode>()->need_auto_scheduler = tvm::Integer(1);
++      return cached_func;
++    }
++    
+     te::Schedule schedule;
+     // No need to register schedule for device copy op.
+     if (anchor_attrs_.as<DeviceCopyAttrs>() == nullptr && create_schedule_) {
+@@ -229,7 +384,7 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+     static auto fpattern = Op::GetAttrMap<TOpPattern>("TOpPattern");
+     static auto flower_call = tvm::runtime::Registry::Get("relay.backend.lower_call");
+     ICHECK(flower_call) << "relay.backend.lower_call is not registered.";
+-
++    
+     Array<te::Tensor> inputs;
+     int count_tuple = 0;
+     for (Expr arg : call_node->args) {
+@@ -260,9 +415,11 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+       LoweredOutput lowered_out = (*flower_call)(GetRef<Call>(call_node), inputs, target_);
+       outputs = lowered_out->outputs;
+       impl = lowered_out->implementation;
++      
++      update_maps_(call_node, outputs);
+     }
+ 
+-    if (create_schedule_) {
++    if (create_schedule_ && !schedule_fusion_) {
+       int op_pattern = fpattern[op];
+       if (!use_auto_scheduler_ && op_pattern >= kCommReduce) {
+         ICHECK(!anchor_op_.defined() || anchor_op_pattern_ < kCommReduce)
+@@ -307,6 +464,7 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+   }
+ 
+   Array<te::Tensor> VisitExpr_(const TupleNode* op) final {
++    VLOG(2) << "TupleNode: " << op << "\n";
+     Array<te::Tensor> fields;
+     for (Expr field : op->fields) {
+       // TODO(mbs): Generalize to be equivalent to FlattenTupleType.
+@@ -315,16 +473,33 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+       ICHECK_EQ(res.size(), 1);
+       fields.push_back(res[0]);
+     }
++    update_maps_(op, fields);
+     return fields;
+   }
+ 
+   Array<te::Tensor> VisitExpr_(const TupleGetItemNode* op) final {
++    VLOG(2) << "TupleGetItemNodeNode: " << op << "\n";
+     const auto* tuple_type = op->tuple->type_as<TupleTypeNode>();
+     Array<te::Tensor> tuple = VisitExpr(op->tuple);
+     ICHECK_EQ(tuple_type->fields.size(), tuple.size());
+     ICHECK_GE(op->index, 0);
+     ICHECK_LT(static_cast<size_t>(op->index), tuple.size());
+-    return {tuple[op->index]};
++    Array<te::Tensor> outputs = {tuple[op->index]};
++    update_maps_(op, outputs);
++    return outputs;
++  }
++
++  void update_maps_(const ExprNode* op, Array<te::Tensor>& outputs) {
++    if (expr_te_map_.count(GetRef<Expr>(op)) == 0){
++      expr_te_map_.insert({GetRef<Expr>(op), outputs});
++    }else{
++      for(auto t: outputs){
++        expr_te_map_[GetRef<Expr>(op)].push_back(t);
++      }
++    }
++    for(auto& t: outputs){
++      te_expr_map_.insert({t, GetRef<Expr>(op)});
++    }
+   }
+ 
+  private:
+@@ -340,6 +515,11 @@ class ScheduleBuilder : public backend::MemoizedExprTranslator<Array<te::Tensor>
+   // overhead for each invocation of call node when retrieving schedules.
+   const Op& device_copy_op_;
+   bool create_schedule_;
++  bool schedule_fusion_;
++  // Record the Relay::Expr to the lowered tensor expressions
++  std::unordered_map<relay::Expr, Array<te::Tensor>, ObjectPtrHash, ObjectPtrEqual> expr_te_map_;
++  // Record which expr produce the tensor
++  std::unordered_map<te::Tensor, relay::Expr, ObjectPtrHash, ObjectPtrEqual> te_expr_map_;
+ };
+ 
+ /*!
+diff --git a/src/relay/backend/te_compiler_cache.h b/src/relay/backend/te_compiler_cache.h
+index 7975ef873..224aa78bd 100644
+--- a/src/relay/backend/te_compiler_cache.h
++++ b/src/relay/backend/te_compiler_cache.h
+@@ -143,6 +143,8 @@ struct CachedFuncNode : public Object {
+   tvm::Array<Integer> shape_func_param_states;
+   /*! \brief The lowered functions to support the function. */
+   IRModule funcs = IRModule(Map<GlobalVar, BaseFunc>({}));
++  /*! \brief Mark the function needs to be scheduled by auto_scheduler */
++  mutable tvm::Integer need_auto_scheduler = tvm::Integer(0);
+ 
+   void VisitAttrs(tvm::AttrVisitor* v) {
+     v->Visit("target", &target);
+@@ -152,6 +154,7 @@ struct CachedFuncNode : public Object {
+     v->Visit("schedule", &schedule);
+     v->Visit("funcs", &funcs);
+     v->Visit("shape_func_param_states", &shape_func_param_states);
++    // v->Visit("need_auto_scheduler", &need_auto_scheduler);
+   }
+ 
+   static constexpr const char* _type_key = "relay.CachedFunc";
+diff --git a/src/relay/backend/tir_attr_metadata_visitor.cc b/src/relay/backend/tir_attr_metadata_visitor.cc
+new file mode 100644
+index 000000000..04c51c9ae
+--- /dev/null
++++ b/src/relay/backend/tir_attr_metadata_visitor.cc
+@@ -0,0 +1,68 @@
++
++#include "tir_attr_metadata_visitor.h"
++
++namespace tvm {
++namespace relay {
++  class TIRAttrMetaDataVisitor: public ExprVisitor {
++    public:
++    Array<te::Tensor> GetOutputTensors(const Expr& body){
++      // Only Visit FunctionNode
++      if(body.as<relay::FunctionNode>()){
++        this->VisitExpr(body);
++      }
++      return this->output_tensors_;
++    }
++    void VisitExpr_(const CallNode* call_node){
++      if (const GlobalVarNode* gvn = call_node->op.as<GlobalVarNode>()) {
++      if (const TIRCallAttrs* attrs = call_node->attrs.as<TIRCallAttrs>()) {
++        VLOG(2) << "call_node->attrs.as<TIRCallAttrs>()";
++        if(attrs->metadata.count("kFusion")){
++          for(auto t: Downcast<Array<te::Tensor>>(attrs->metadata["output_tensors"])){
++            this->output_tensors_.push_back(t);
++          }
++        }
++      }
++      }
++      for(auto arg: call_node->args){
++        this->VisitExpr(arg);
++      }
++    }
++
++  private:
++    Array<te::Tensor> output_tensors_;
++  };
++
++  Array<te::Tensor> GetOutputTensorsFromRelayFunc(const Expr& body){
++    return TIRAttrMetaDataVisitor().GetOutputTensors(body);
++  }
++
++  Map<GlobalVar, Array<te::Tensor>> GetPerVarTensorsFromIRModule(const IRModule& mod){
++    auto var_tensors_map = Map<GlobalVar, Array<te::Tensor>>();
++    
++    // Get kFusion output_tensors
++    for(auto ele: mod->functions){
++      VLOG(2) << ele.first << ele.second;
++      auto output_tensors = GetOutputTensorsFromRelayFunc(ele.second);
++      if(output_tensors.size()==0){
++        continue;
++      }
++      var_tensors_map.Set(ele.first, output_tensors);
++      VLOG(2) << "GetOutputTensorsFromRelayFunc:";
++      for(auto t: output_tensors){
++        VLOG(2) << t;
++      }
++    }
++
++    return var_tensors_map;
++  }
++
++  void PrintVarTensorMap(const Map<GlobalVar, Array<te::Tensor>>& var_tensor_map) {
++    for(auto ele: var_tensor_map) {
++      VLOG(2) << ele.first;
++      for(auto t: ele.second) {
++        VLOG(2) << t;
++      }
++    }
++  }
++}
++}
+\ No newline at end of file
+diff --git a/src/relay/backend/tir_attr_metadata_visitor.h b/src/relay/backend/tir_attr_metadata_visitor.h
+new file mode 100644
+index 000000000..79dd78415
+--- /dev/null
++++ b/src/relay/backend/tir_attr_metadata_visitor.h
+@@ -0,0 +1,26 @@
++
++#ifndef TIR_ATTR_METADATA_VISITOR
++#define TIR_ATTR_METADATA_VISITOR
++
++#include <tvm/relay/analysis.h>
++#include <tvm/relay/expr_functor.h>
++#include <tvm/relay/attrs/nn.h>
++#include <tvm/relay/op_attr_types.h>
++#include <tvm/relay/transform.h>
++#include <tvm/tir/op.h>
++#include <tvm/relay/attrs/annotation.h>
++#include <tvm/relay/attrs/debug.h>
++
++namespace tvm {
++namespace relay {
++
++  Array<te::Tensor> GetOutputTensorsFromRelayFunc(const Expr& body);
++
++  Map<GlobalVar, Array<te::Tensor>> GetPerVarTensorsFromIRModule(const IRModule& mod);
++
++  void PrintVarTensorMap(const Map<GlobalVar, Array<te::Tensor>>& var_tensor_map);
++
++}
++}
++
++#endif
+diff --git a/src/relay/backend/utils.cc b/src/relay/backend/utils.cc
+index 02caf56c6..bd28ab5b2 100644
+--- a/src/relay/backend/utils.cc
++++ b/src/relay/backend/utils.cc
+@@ -209,6 +209,7 @@ Array<Pass> GetPassPrefix(const Map<tvm::Integer, tvm::Target>& targets, bool is
+   if (is_vm) {
+     pass_seqs.push_back(transform::InlinePrimitives());
+   }
++  pass_seqs.push_back(transform::HorizontalFusion(2));
+   pass_seqs.push_back(transform::CombineParallelConv2D(3));
+   pass_seqs.push_back(transform::CombineParallelDense(3));
+   pass_seqs.push_back(transform::CombineParallelBatchMatmul(3));
+diff --git a/src/relay/backend/utils.h b/src/relay/backend/utils.h
+index a647aa1a3..39c24ca56 100644
+--- a/src/relay/backend/utils.h
++++ b/src/relay/backend/utils.h
+@@ -149,6 +149,7 @@ struct LoweredOutput {
+   Map<String, FunctionInfo> function_metadata;
+   std::unordered_map<std::string, std::pair<int, const tvm::runtime::NDArray>> params;
+   runtime::Metadata metadata;
++  Map<GlobalVar, Array<te::Tensor>> var_tensor_map;
+ };
+ 
+ /*!
+diff --git a/src/relay/ir/transform.cc b/src/relay/ir/transform.cc
+index eacd3783d..991f31099 100644
+--- a/src/relay/ir/transform.cc
++++ b/src/relay/ir/transform.cc
+@@ -138,6 +138,9 @@ IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx)
+ 
+   std::vector<std::pair<GlobalVar, Function> > updates;
+   for (const auto& it : updated_mod->functions) {
++    std::stringstream os;
++    os << "FunctionPass " << it.first << " " << it.second.as<FunctionNode>();
++    LOG(INFO) << os.str();
+     // only picks up relay::Function
+     if (auto* n = it.second.as<FunctionNode>()) {
+       Function func = GetRef<Function>(n);
+diff --git a/src/relay/op/tensor/transform.cc b/src/relay/op/tensor/transform.cc
+index 90a0e3150..332aad89c 100644
+--- a/src/relay/op/tensor/transform.cc
++++ b/src/relay/op/tensor/transform.cc
+@@ -2828,6 +2828,7 @@ bool SplitRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
+     auto begin = IndexExpr(tir::make_zero(DataType::Int(32)));
+     std::vector<Type> fields;
+     for (unsigned int i = 0; i < indices.size(); ++i) {
++      VLOG(2) << "indices[i]: " << indices[i] << " begin:" << begin << "\n";
+       ICHECK(reporter->Assert(indices[i] > begin))
+           << "indices_or_sections need to be a sorted ascending list";
+       std::vector<IndexExpr> oshape(data->shape.begin(), data->shape.end());
+diff --git a/src/relay/transforms/device_aware_visitors.cc b/src/relay/transforms/device_aware_visitors.cc
+index 28aeab605..d2138d1de 100644
+--- a/src/relay/transforms/device_aware_visitors.cc
++++ b/src/relay/transforms/device_aware_visitors.cc
+@@ -257,6 +257,9 @@ Expr DeviceAwareExprMutator::VisitExpr_(const LetNode* let_node) {
+ Expr DeviceAwareExprMutator::VisitExpr_(const CallNode* call_node) {
+   auto props = GetOnDeviceProps(call_node);
+   if (props.body.defined() && props.is_fixed) {
++    std::stringstream os;
++    os << "call.body: " << props.body;
++    LOG(INFO) << os.str();
+     // Entering lexical scope of fixed "on_device" call.
+     PushDeviceType(props.device_type);
+     Expr expr = VisitExpr(props.body);
+diff --git a/src/relay/transforms/fold_constant.h b/src/relay/transforms/fold_constant.h
+new file mode 100644
+index 000000000..7ec3398bc
+--- /dev/null
++++ b/src/relay/transforms/fold_constant.h
+@@ -0,0 +1,7 @@
++#include <tvm/relay/expr.h>
++
++namespace tvm {
++namespace relay {
++  Expr FoldConstant(const Expr& expr, const IRModule& mod);
++}
++}
+\ No newline at end of file
+diff --git a/src/relay/transforms/fuse_ops.cc b/src/relay/transforms/fuse_ops.cc
+index 960f56957..641795d95 100644
+--- a/src/relay/transforms/fuse_ops.cc
++++ b/src/relay/transforms/fuse_ops.cc
+@@ -490,6 +490,18 @@ class DominatorTree {
+     }
+     return tnode;
+   }
++
++  void DebugDump() {
++    std::ostringstream os;
++    os << "tree:\n";
++    for (size_t i = 0; i < nodes.size(); ++i) {
++      Node* node = nodes[i];
++      os << "node[" << i << "], " << GetRef<ObjectRef>(node->gnode->ref);
++      os << " depth: " << node->depth << " pattern: " << node->pattern;
++      os << "\n";
++    }
++    LOG(INFO) << os.str();
++  }
+ };
+ 
+ DominatorTree DominatorTree::PostDom(support::Arena* arena, const IndexedForwardGraph& graph) {
+@@ -500,6 +512,7 @@ DominatorTree DominatorTree::PostDom(support::Arena* arena, const IndexedForward
+     size_t index = i - 1;
+     tree.nodes[index] = tree.GetNode(arena, graph.post_dfs_order[index]);
+   }
++  tree.DebugDump();
+   return tree;
+ }
+ 
+@@ -813,13 +826,14 @@ class FuseMutator : private MixedModeMutator {
+   Expr Transform(const Expr& body, int fuse_opt_level, size_t max_fuse_depth) {
+     // setup the group map.
+     auto graph = IndexedForwardGraph::Create(&arena_, body);
++    graph.DebugDump();
+     auto groups = GraphPartitioner(&arena_, fuse_opt_level, max_fuse_depth).Partition(graph);
+     for (size_t nid = 0; nid < graph.post_dfs_order.size(); ++nid) {
+       ICHECK(graph.post_dfs_order[nid]->ref != nullptr);
+       gmap_[graph.post_dfs_order[nid]->ref] = groups[nid];
+     }
+     // The following line can be used for debug.
+-    // this->DebugDumpGroup(body);
++    this->DebugDumpGroup(body);
+     return this->Mutate(body);
+   }
+ 
+@@ -887,10 +901,12 @@ class FuseMutator : private MixedModeMutator {
+       if (ret_group->root_ref == call) {
+         // This is the root of the group
+         // create the new call node.
++        LOG(INFO) << "root_ref: " << GetRef<Call>(call) << "\n";
+         return MakeNewFunction(ret_group, call->checked_type(), new_call);
+       } else {
+         // This is an intermediate node of a fused function
+         // simply return the new call.
++        LOG(INFO) << "intermediate: " << GetRef<Call>(call) << "\n";
+         return std::move(new_call);
+       }
+     } else {
+diff --git a/src/relay/transforms/fuse_tensor_expression.cc b/src/relay/transforms/fuse_tensor_expression.cc
+new file mode 100644
+index 000000000..bbf90b99c
+--- /dev/null
++++ b/src/relay/transforms/fuse_tensor_expression.cc
+@@ -0,0 +1,251 @@
++#include "fuse_tensor_expression.h"
++
++#include <tvm/relay/analysis.h>
++#include <tvm/relay/expr_functor.h>
++#include <tvm/relay/attrs/nn.h>
++#include <tvm/relay/op_attr_types.h>
++#include <tvm/relay/transform.h>
++#include <tvm/tir/op.h>
++#include <tvm/te/operation.h>
++#include <tvm/tir/stmt_functor.h>
++#include <tvm/topi/transform.h>
++#include <tvm/tir/stmt.h>
++
++#include <queue>
++#include <vector>
++#include <unordered_map>
++#include <set>
++#include <utility>
++
++#include "../../support/arena.h"
++#include "expr_subst.h"
++#include "pattern_utils.h"
++#include "fold_constant.h"
++
++namespace tvm {
++namespace relay {
++using namespace tvm::tir;
++using namespace tvm::te;
++
++using TensorMap = std::unordered_map<Tensor, Tensor, ObjectPtrHash, ObjectPtrEqual>;
++
++extern Expr FoldConstant(const Expr& expr, const IRModule& mod);
++
++bool check_only_one_compute(const te::Tensor& output_tensor, 
++  std::vector<te::Tensor>& compute_branch, std::vector<te::Tensor>& placeholder_branch) {
++  size_t count = 0;
++  te::Tensor input_tensor_compute;
++  for(auto tensor: output_tensor->op->InputTensors()){
++    if(tensor->op.as<te::ComputeOpNode>()){
++      count++;
++      input_tensor_compute = tensor;
++      compute_branch.push_back(tensor);
++    }else if(tensor->op.as<PlaceholderOpNode>()){
++      placeholder_branch.push_back(tensor);
++    }
++  }
++  if(count==1){
++    return check_only_one_compute(input_tensor_compute, compute_branch, placeholder_branch);
++  }else if(count==0){
++    return true;
++  }else{
++    return false;
++  }
++};
++
++
++// Modify a ComputeOp's ProducerLoad all related with specific tensor
++class ProduceLoadInseartIndiceRewriter : public StmtExprMutator {
++  public:
++  
++  ProduceLoadInseartIndiceRewriter(te::Var index_var, TensorMap& replace_map)
++    : index_var_(index_var), replace_map_(replace_map) {}
++
++  PrimExpr Rewrite(PrimExpr expr) { 
++    VLOG(2) << "Start rewrite: " << expr;
++    return this->VisitExpr(expr); 
++  }
++
++  // Modify the ProducerLoad and it's producer at the same time
++  PrimExpr VisitExpr_(const ProducerLoadNode* op) final {
++    PrimExpr expr = StmtExprMutator::VisitExpr_(op);
++    op = expr.as<ProducerLoadNode>();
++    te::Tensor t = Downcast<te::Tensor>(op->producer);
++    if(this->replace_map_.count(t)) {
++      Array<PrimExpr> new_args = {this->index_var_};
++      for(auto arg: op->indices){
++        new_args.push_back(arg);
++      }
++      auto new_expr = ProducerLoad(replace_map_[t], new_args);
++      VLOG(2) << "NewProducerLoad: " << new_expr << " replace old " << t 
++        << " " << ObjectPtrHash()(t) << " with " << replace_map_[t] << " " <<ObjectPtrHash()(replace_map_[t]);
++      return new_expr;
++    }
++    return expr;
++  }
++
++  private:
++  te::Var index_var_;
++  TensorMap replace_map_;
++};
++
++Tensor RecursiveTensorRewriter(const Tensor& tensor, TensorMap& placeholder_map, const size_t num_branches){
++  if(auto compute_op = tensor->op.as<ComputeOpNode>()){
++    TensorMap replace_map;
++    auto input_tensors = compute_op->InputTensors();
++    // Get new body
++    for(auto& it: input_tensors){
++      if(it->op.as<ComputeOpNode>()){
++        auto new_it = RecursiveTensorRewriter(it, placeholder_map, num_branches);
++        ICHECK(new_it != NullValue<Tensor>());
++        replace_map.insert({it, new_it});
++        VLOG(2) << "replace_map.insert({it, new_it}); " << it->op << " -> " << new_it->op;
++      }else if(it->op.as<PlaceholderOpNode>()){
++        auto new_it = placeholder_map[it];
++        replace_map.insert({it, new_it});
++      }else{
++        LOG_FATAL << "Unknow tensor op: " << it->op;
++      }
++    }
++
++    // Rewrite new body
++    auto new_var = tir::Var("g");
++    auto rewriter = ProduceLoadInseartIndiceRewriter(new_var, replace_map);
++    Array<PrimExpr> new_body;
++    for(auto prim_expr: compute_op->body){
++      auto new_prim_expr = rewriter.Rewrite(prim_expr);
++      VLOG(2) << "new_prim_expr: " << new_prim_expr;
++      new_body.push_back(new_prim_expr);
++    }
++    // Rewrite new axis and attrs
++    Array<IterVar> new_axis = {tir::IterVar(tvm::Range(0, (int32_t)num_branches), new_var, IterVarType::kDataPar)};
++    for(auto iter_var: compute_op->axis) {
++      new_axis.push_back(iter_var);
++    }
++    Map<String, ObjectRef> new_attrs;
++    if (compute_op->tag=="conv2d_nchw") {
++      new_attrs = {};
++    } else {
++      new_attrs = compute_op->attrs;
++    }
++    auto new_compute = te::ComputeOp(compute_op->name, compute_op->tag, new_attrs, new_axis, new_body);
++    // Rewrite new shape
++    auto new_shape = Array<PrimExpr>({(int32_t)num_branches});
++    for(auto s: tensor->shape){
++      new_shape.push_back(s);
++    }
++    // Return new Tensor
++    return te::Tensor(new_shape, tensor->dtype, new_compute, tensor->value_index);
++  }else{
++    return NullValue<Tensor>();
++  }
++}
++
++
++class PrimFuncFusionRewriteV3 {
++public:
++  PrimFuncFusionRewriteV3(std::unordered_map<te::Tensor, Expr, ObjectPtrHash, ObjectPtrEqual> tensor_constant_map) 
++  : tensor_constant_map_(tensor_constant_map){};
++  Array<te::Tensor> Transform(Array<te::Tensor> outputs) {
++    Array<te::Tensor> to_be_combined_tensors = outputs;
++    // size_t num_of_tensor_produced_by_compute_op = 0;
++    // size_t num_of_tensor_produced_by_placeholder_op = 0;
++    // If the output is a sink op, we trace it's inputs to find the branches
++    while(to_be_combined_tensors.size() == 1) {
++      auto tmp_tensors = to_be_combined_tensors[0]->op->InputTensors();
++      to_be_combined_tensors.clear();
++      for(auto tensor: tmp_tensors){
++        if(tensor->op.as<te::ComputeOpNode>()){
++          to_be_combined_tensors.push_back(tensor);
++        }
++      }
++    }
++    // We assume in each branch each ComputeOp's input tensors only contains one tensor
++    // that is produced by computeOp
++    // We check here
++    const size_t num_of_branches = to_be_combined_tensors.size();
++    std::vector<std::vector<te::Tensor>> compute_branches(num_of_branches);
++    std::vector<std::vector<te::Tensor>> placeholder_branches(num_of_branches);
++
++    bool all_branch_only_one = true;
++    size_t i = 0;
++    for(auto& tensor: to_be_combined_tensors){
++      all_branch_only_one &= check_only_one_compute(tensor, compute_branches[i], placeholder_branches[i]);
++      i++;
++    }
++    ICHECK(all_branch_only_one);
++    // TODO(Chunwei Xia) Structural Equal can not help to compare two PrimExprs
++    // BFS to Check Structure equal
++    bool equal = true;
++    StructuralEqual seq;
++    for(size_t j=0; j<compute_branches[0].size(); ++j){
++      for(i=0; i<num_of_branches; ++i){
++        VLOG(2) << "Compare " << (compute_branches[0][j]->op) << " and " << compute_branches[i][j]->op;
++        equal = (equal && seq(Downcast<te::ComputeOp>(compute_branches[0][j]->op)->body,
++          Downcast<te::ComputeOp>(compute_branches[i][j]->op)->body));
++        if(!equal){
++          LOG_WARNING << compute_branches[0][j]->op
++            << " and " << compute_branches[i][j]->op << "Structure not equal";
++        }
++      }
++    }
++    // ICHECK(equal);
++    // Now concate all placeholder and insert in placeholder->concated_placeholder map
++    // We need to fold constant weights here
++    TensorMap placeholder_replace_map;
++    for(size_t j=0; j<compute_branches[0].size(); ++j){
++      Array<Tensor> tuple;
++      Array<Expr> expr_fields;
++      bool find_constant = false;
++      for(i=0; i<num_of_branches; ++i){
++        tuple.push_back(placeholder_branches[i][j]);
++        if(this->tensor_constant_map_.count(placeholder_branches[i][j])){
++          expr_fields.push_back(this->tensor_constant_map_[placeholder_branches[i][j]]);
++          find_constant = true;
++        }
++      }
++      if(find_constant){
++        auto expr_concated = relay::MakeConcatenate(relay::Tuple(expr_fields), 0);
++        auto expr_new_shape = Array<tvm::Integer>({tvm::Integer((int32_t)num_of_branches)});
++        for(auto prim_expr: tuple[0]->shape){
++          expr_new_shape.push_back(Downcast<tvm::Integer>(prim_expr));
++        }
++        auto expr_reshaped = relay::MakeReshape(expr_concated, expr_new_shape);
++        IRModule module;
++        auto result_constant = FoldConstant(expr_reshaped, module);
++        VLOG(2) << result_constant;
++        auto expr_constant = Downcast<Constant>(result_constant);
++        tvm::te::Tensor concated_tensor = tvm::te::placeholder(expr_constant->tensor_type()->shape, expr_constant->tensor_type()->dtype);
++        placeholder_replace_map.insert({placeholder_branches[0][j], concated_tensor});
++      }else{
++        auto concated = topi::concatenate(tuple, 0);
++        auto new_shape = Array<PrimExpr>({(int32_t)num_of_branches});
++        for(auto prim_expr: tuple[0]->shape){
++          new_shape.push_back(prim_expr);
++        }
++        placeholder_replace_map.insert({placeholder_branches[0][j], topi::reshape(concated, new_shape)});
++      }
++    }
++    // Next we visit the first branch in PostOrder
++    // First rewrite the computeOp's body that consume placeholder, 
++    // then return a new computeOp with a new tensor, then rewrite
++    Array<Tensor> new_outputs;
++    // We only need to rewrite one branch
++    new_outputs.push_back(RecursiveTensorRewriter(outputs[0], placeholder_replace_map, num_of_branches));
++    return new_outputs;
++  }
++
++  private:
++  std::unordered_map<te::Tensor, Expr, ObjectPtrHash, ObjectPtrEqual> tensor_constant_map_;
++};
++
++
++namespace transform {
++  Array<te::Tensor> FFusionTensorExpression(Array<te::Tensor> outputs, 
++    std::unordered_map<te::Tensor, Expr, ObjectPtrHash, ObjectPtrEqual> tensor_constant_map){
++    auto fusion = PrimFuncFusionRewriteV3(tensor_constant_map);
++    return fusion.Transform(outputs);
++  }
++}
++}
++}
+\ No newline at end of file
+diff --git a/src/relay/transforms/fuse_tensor_expression.h b/src/relay/transforms/fuse_tensor_expression.h
+new file mode 100644
+index 000000000..c552c3df5
+--- /dev/null
++++ b/src/relay/transforms/fuse_tensor_expression.h
+@@ -0,0 +1,15 @@
++#ifndef FUSE_TENSOR_EXPRESSION_H
++#define FUSE_TENSOR_EXPRESSION_H
++
++#include <tvm/te/tensor.h>
++#include <tvm/relay/expr.h>
++namespace tvm {
++namespace relay {
++namespace transform{
++  Array<te::Tensor> FFusionTensorExpression(Array<te::Tensor> outputs, 
++    std::unordered_map<te::Tensor, Expr, ObjectPtrHash, ObjectPtrEqual> tensor_constant_map);
++}
++}
++}
++
++#endif
+\ No newline at end of file
+diff --git a/src/relay/transforms/horizontal_fuse_op.cc b/src/relay/transforms/horizontal_fuse_op.cc
+new file mode 100644
+index 000000000..0f3145a7a
+--- /dev/null
++++ b/src/relay/transforms/horizontal_fuse_op.cc
+@@ -0,0 +1,965 @@
++
++/**
++ * \file horizontal_fuse_op.cc
++ *
++ *
++ * \brief Fuse ops horizontally
++ *
++ * Firstly we try to visit the packedFunction created by te::compute
++ */
++
++#include <tvm/relay/analysis.h>
++#include <tvm/relay/expr_functor.h>
++#include <tvm/relay/attrs/nn.h>
++#include <tvm/relay/op_attr_types.h>
++#include <tvm/relay/transform.h>
++#include <tvm/tir/op.h>
++
++#include <queue>
++#include <vector>
++#include <unordered_map>
++
++#include "../../support/arena.h"
++#include "expr_subst.h"
++#include "pattern_utils.h"
++
++namespace tvm {
++namespace relay {
++
++using support::LinkedList;
++using support::LinkNode;
++
++template<typename X>
++using ExprMap = std::unordered_map<Expr, X, ObjectPtrHash, ObjectPtrEqual>;
++using ExprSet = std::unordered_set<Expr, ObjectPtrHash, ObjectPtrEqual>;
++using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
++using ConstSet = std::unordered_set<Constant, ObjectPtrHash, ObjectPtrEqual>;
++using Branch = std::vector<Expr>;
++using Group = std::vector<Branch>;
++using ExprSubstMap = std::unordered_map<Expr, Expr, ObjectPtrHash, ObjectPtrEqual>;
++// template<typename Y>
++// using NodePtrMap = std::unordered_map<const relay::ExprNode*, Y, ObjectHash, ObjectEqual>;
++// using NodePtrMap = std::unordered_map<const relay::ExprNode*, Y, ObjectHash, ObjectEqual>;
++/*!
++ * \brief Indexed data flow graph in forward direction.
++ *  This is a temporary data structure used for operator fusion analysis.
++ *
++ *  This data structure only captures the dataflow fragment and
++ *  could ignore blocks like let by simply ordering each dataflow block
++ *  and mark the output node as extern_ref;
++ */
++class UpwardRankGraph {
++ public:
++  struct Node;
++  /*!
++   * The forward edge in the dataflow graph.
++   */
++  struct Edge {
++    /*! \brief The corresponding node */
++    Node* node{nullptr};
++    /*! \brief The respective pattern of this op */
++    OpPatternKind pattern{kOpaque};
++  };
++  /*! \brief A node in the graph. */
++  struct Node {
++    /*! \brief weak reference to the corresponding edge. */
++    const ExprNode* ref{nullptr};
++    /*! \brief The index of the node in topological order. */
++    size_t index{0};
++    /*! \brief The upward rank of the node in topological order. */
++    size_t rank{0};
++    /*! \brief Whether this node is referenced by external source */
++    bool extern_ref{false};
++    /*! \brief The general pattern in the node */
++    OpPatternKind pattern{kOpaque};
++    /*! \brief The outputs of the node. */
++    LinkedList<Edge> outputs;
++  };
++  /*! \brief The node map that maps node to graph */
++  ExprMap<Node*> node_map;
++  /*! \brief All the nodes in post DFS order */
++  std::vector<Node*> forward_bfs_order;
++  /*! \brief uprank to array of exprs with same uprank */
++  std::unordered_map<size_t, std::vector<Expr>> uprank_array_map;
++  // Data flow from input to output, thus the input is parent and output is child
++  /*! \brief From child to parents */
++  ExprMap<ExprSet> child_to_parent_map_;
++  /*! \brief From parents to child */
++  ExprMap<ExprSet> parent_to_children_map_;
++  /*! \brief input variables of the relay graph */
++  VarSet input_vars_;
++  /*! \brief constant weights of the relay graph */
++  ConstSet ops_weights_;
++  /*! \brief Operators that can be fused */
++  std::vector<Group> groups;
++  /*! \brief Dump the graph into string. */
++  void DebugDump() {
++    std::ostringstream os;
++    for (size_t i = 0; i < forward_bfs_order.size(); ++i) {
++      Node* node = forward_bfs_order[i];
++      os << "node[" << i << "], " << GetRef<Expr>(node->ref) << " uprank " << node->rank;
++      // for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
++      //   os << link->value.node->index << ", ";
++      // }
++      os << "]\n";
++    }
++    LOG(INFO) << os.str();
++  }
++  /*!
++   * \brief create a indexed forward graph.
++   * \param arena The arena used for data allocation.
++   * \param body The body of the expression to create a graph.
++   */
++  static UpwardRankGraph Create(support::Arena* arena, const Expr& body);
++
++  ExprSet getExprChildren(Expr call){
++    if(this->parent_to_children_map_.count(call)){
++      return this->parent_to_children_map_[call];
++    }else{
++      return ExprSet();
++    }
++  }
++
++  std::pair<bool, Expr> IsChildTuple(const Branch& branch){
++    auto last_op_in_fist_branch = branch.back();
++    if(!this->parent_to_children_map_.count(last_op_in_fist_branch)){
++      return std::make_pair(false, Expr());
++    }
++    auto children_set = this->parent_to_children_map_[last_op_in_fist_branch];
++    VLOG(1) << "last_op_in_branch: " << last_op_in_fist_branch << " child_0: " << *(children_set.begin());
++    if(children_set.size() == 1){
++      auto it = children_set.begin();
++      if((*it).as<TupleNode>()){
++        return std::make_pair(true, *it);
++      }
++    }
++    return std::make_pair(false, Expr());
++  }
++
++  // Whether all the branches in a group sink to a concate op
++  std::pair<bool, Expr> IsGroupSinkToTuple_(const Group& g){
++    if(g.size()==0){
++      return std::make_pair(false, Expr());
++    }
++    auto result_a = IsChildTuple(g[0]);
++    if(!result_a.first){
++      return std::make_pair(false, Expr());
++    }
++    for(auto branch: g){
++      auto result_b = IsChildTuple(branch);
++      if(result_a != result_b){
++        return std::make_pair(false, Expr());
++      }
++    }
++    return std::make_pair(true, result_a.second);
++  }
++ public:
++  class Creator;
++};
++
++
++
++// class HoriFusionMutator : private ExprVisitor {
++class UpwardRankGraph::Creator : private ExprVisitor {
++ public:
++  explicit Creator(support::Arena* arena) : arena_(arena) {}
++
++  UpwardRankGraph Transform(const Expr& body) {
++    this->VisitExpr(body);
++    // graph_.groups = this->FindFusedConv2DOps_();
++    graph_.groups = this->FindFusedConv2DBlocksV2_();
++    return std::move(graph_);
++  }
++
++ private:
++  
++  /*! \brief Internal arena. */
++  support::Arena* arena_;
++  UpwardRankGraph graph_;
++
++  // For now we assume that FunctionNode is at the top level
++  void VisitExpr_(const FunctionNode* f) {
++    VLOG(2) << "Visit: " << GetRef<Function>(f);
++    this->VisitExpr(f->body);
++    // FindInputVars_(f->body);
++    DumpDebugRelationMap(graph_.parent_to_children_map_);
++    DebugDumpInputVars_();
++    BuildUprankGraph_();
++    graph_.DebugDump();
++  }
++
++
++  void VisitExpr_(const CallNode* c) {
++    VLOG(2) << "Visit: " << GetRef<Call>(c);
++    this->VisitExpr(c->op);
++    UpdateRelationMap_(GetRef<Call>(c), c->args);
++    for(auto& arg: c->args) {
++      this->VisitExpr(arg);
++    }
++  }
++  
++  void VisitExpr_(const TupleNode* op){
++    VLOG(2) << "Visit: " << GetRef<Tuple>(op);
++    UpdateRelationMap_(GetRef<Tuple>(op), op->fields);
++    for(auto& f: op->fields){
++      this->VisitExpr(f);
++    }
++  }
++
++  void VisitExpr_(const TupleGetItemNode* op){
++    VLOG(2) << "Visit: " << GetRef<TupleGetItem>(op);
++    UpdateRelationMap_(GetRef<TupleGetItem>(op), Array<Expr>({op->tuple}));
++    this->VisitExpr(op->tuple);
++  }
++
++  void VisitExpr_(const OpNode* op) {
++    std::ostringstream os;
++    auto op_ref = GetRef<ObjectRef>(op);
++    static auto fpattern = Op::GetAttrMap<TOpPattern>("TOpPattern");
++    if(fpattern.count(GetRef<Op>(op))){
++      auto op_pattern = static_cast<OpPatternKind>(fpattern[GetRef<Op>(op)]);
++      os << "name " << op->name << " ";
++      VLOG(2) << os.str() << "pattern " << op_pattern << " VisitExpr OpNode";
++    }
++  }
++
++  void VisitExpr_(const VarNode* op) {
++    VLOG(2) << "Visit: Var: " << op->name_hint();
++    graph_.input_vars_.insert(GetRef<Var>(op));
++  }
++
++  void VisitExpr_(const ConstantNode* op) {
++    VLOG(2) << "Visit: Constant: " << op->data;
++    graph_.ops_weights_.insert(GetRef<Constant>(op));
++  }
++
++  // child consume data produced by parents
++  // parent_map_ is child->parents
++  // child_map_ is parents->child
++  void UpdateRelationMap_(Expr child, Array<Expr> parents) {
++    for (size_t i = 0; i < parents.size(); ++i) {
++      // Update parent->children
++      auto p = parents[i];
++      if (graph_.parent_to_children_map_.count(p) == 0) {
++        auto children_set = ExprSet({child});
++        graph_.parent_to_children_map_.insert({p, children_set});
++      } else {
++        graph_.parent_to_children_map_[p].insert(child);
++      }
++
++      // Update child->parents
++      if (graph_.child_to_parent_map_.count(child) == 0) {
++        graph_.child_to_parent_map_.insert({child, ExprSet({p})});
++      } else {
++        graph_.child_to_parent_map_[child].insert(p);
++      }
++    }
++  }
++
++  std::string GetExprNodeTypeStr(Expr relay_expr){
++    if(relay_expr.as<ConstantNode>()){
++      return "Constant";
++    }else if(relay_expr.as<VarNode>()){
++      return "Var";
++    }else if(relay_expr.as<TupleNode>()){
++      return "Tuple";
++    }else if(relay_expr.as<CallNode>()){
++      return "Call";
++    }else if(relay_expr.as<LetNode>()){
++      return "Let";
++    }else if(relay_expr.as<LetNode>()){
++      return "Let";
++    }else if(relay_expr.as<TupleGetItemNode>()){
++      return "TupleGetItem";
++    }else if(relay_expr.as<RefCreateNode>()){
++      return "RefCreate";
++    }else if(relay_expr.as<RefReadNode>()){
++      return "RefRead";
++    }else{
++      return "Maybe RefWriteNode or TempExprNode";
++    }
++  }
++
++  void DumpDebugRelationMap(ExprMap<ExprSet>& r_map) {
++    for (auto it = r_map.begin(); it != r_map.end(); ++it) {
++      std::string child_op_type = GetExprNodeTypeStr(it->first);
++      for (auto& to_expr: it->second) {
++        std::string parent_op_type = GetExprNodeTypeStr(to_expr);
++        VLOG(2) << child_op_type << " to " << parent_op_type << " " << it->first << "a->b" << to_expr;
++      }
++    }
++  }
++
++  // void FindInputVars_(Expr body) {
++  //   auto expr_queue = std::queue<Expr>();
++  //   expr_queue.push(body);
++  //   while (!expr_queue.empty()) {
++  //     auto current_expr = expr_queue.front();
++  //     expr_queue.pop();
++  //     if (current_expr.as<VarNode>()) {
++  //       ICHECK(graph_.parent_map_.count(current_expr) == 0);
++  //       graph_.input_vars_.insert(Downcast<Var>(current_expr));
++  //     } else if (current_expr.as<ConstantNode>()) {
++  //       // Save constant node as weights we need further
++  //       ICHECK(graph_.parent_map_.count(current_expr) == 0);
++  //       graph_.ops_weights_.insert(Downcast<Constant>(current_expr));
++  //     } else if (graph_.parent_map_.count(current_expr)) {
++  //       for (auto& parent_expr : graph_.parent_map_[current_expr]) {
++  //         expr_queue.push(parent_expr);
++  //       }
++  //     } else {
++  //       VLOG(2) << "Special case need to be handled " << current_expr << "\n";
++  //     }
++  //   }
++  // }
++  
++  void AddNode(Expr op_expr){
++    if(graph_.node_map.count(op_expr) == 0){
++      UpwardRankGraph::Node* op_node = arena_->make<UpwardRankGraph::Node>();
++      op_node->ref = op_expr.as<ExprNode>();
++      op_node->index = graph_.forward_bfs_order.size();
++      graph_.forward_bfs_order.push_back(op_node);
++      graph_.node_map[op_expr] = op_node;
++      if(!graph_.child_to_parent_map_.count(op_expr)){
++        op_node->rank = 0;
++      }else{
++        for(auto& p: graph_.child_to_parent_map_[op_expr]){
++          if(!graph_.node_map.count(p)){
++            LOG_FATAL << "!graph_.node_map.count(p) " << op_expr << " parent: " << p;
++          }
++          graph_.node_map[op_expr]->rank = std::max(graph_.node_map[op_expr]->rank, graph_.node_map[p]->rank + 1);
++        }
++      }
++      auto it = graph_.uprank_array_map.find(op_node->rank);
++      if(it==graph_.uprank_array_map.end()){
++        std::vector<Expr> expr_arr;
++        graph_.uprank_array_map.insert({op_node->rank, {op_expr}});
++      }else{
++        (*it).second.push_back(op_expr);
++      }
++      std::ostringstream os;
++      os << "Add " << GetRef<Expr>(op_node->ref) << " up rank " << op_node->rank << "\n";
++      VLOG(2) << os.str();
++    }
++  }
++
++  void BuildUprankGraph_() {
++    // First add vars to graph
++    ExprSet visited;
++    std::queue<Expr> tmp_queue;
++    for (auto op_var: graph_.input_vars_) {
++      this->AddNode(op_var);
++      tmp_queue.push(op_var);
++    }
++    for (auto op_const: graph_.ops_weights_) {
++      this->AddNode(op_const);
++    }
++    // We start from vars and use bfs to traverse the whole expr
++    while(!tmp_queue.empty()){
++      auto top = tmp_queue.front();
++      tmp_queue.pop();
++      if(graph_.parent_to_children_map_.count(top)){
++        for(auto child: graph_.parent_to_children_map_[top]){
++          if(!visited.count(child)){
++            this->AddNode(child);
++            visited.insert(child);
++            tmp_queue.push(child);
++          }
++        }        
++      }
++    }
++  }
++
++  bool CanConv2DOpsBeCombined(const CallNode* a, const CallNode* b) {
++    StructuralEqual eq;
++    const Layout kOIHW("OIHW");
++    const auto* attrs_a = a->attrs.as<Conv2DAttrs>();
++    const auto* attrs_b = b->attrs.as<Conv2DAttrs>();
++    ICHECK(attrs_a);
++    ICHECK(attrs_b);
++    const auto* tweight_a = a->args[1]->type_as<TensorTypeNode>();
++    const auto* tweight_b = b->args[1]->type_as<TensorTypeNode>();
++    const auto shape_a =
++        tir::BijectiveLayout(Layout(attrs_a->kernel_layout), kOIHW).ForwardShape(tweight_a->shape);
++    const auto shape_b =
++        tir::BijectiveLayout(Layout(attrs_b->kernel_layout), kOIHW).ForwardShape(tweight_b->shape);
++
++    return eq(attrs_a->strides, attrs_b->strides) && eq(attrs_a->padding, attrs_b->padding) &&
++           eq(attrs_a->dilation, attrs_b->dilation) && eq(attrs_a->groups, attrs_b->groups) &&
++           eq(attrs_a->data_layout, attrs_b->data_layout) &&
++           eq(attrs_a->kernel_layout, attrs_b->kernel_layout) &&
++           eq(attrs_a->out_dtype, attrs_b->out_dtype) &&
++           eq(attrs_a->out_layout, attrs_b->out_layout) && eq(shape_a[2], shape_b[2]) &&
++           eq(shape_a[3], shape_b[3]);
++  }
++
++  bool CanBatchNorOpsBeCombined(const CallNode* a, const CallNode* b){
++    StructuralEqual eq;
++    const auto* attrs_a = a->attrs.as<BatchNormAttrs>();
++    const auto* attrs_b = b->attrs.as<BatchNormAttrs>();
++    ICHECK(attrs_a);
++    ICHECK(attrs_b);
++    return eq(attrs_a->axis, attrs_b->axis) && eq(attrs_a->epsilon, attrs_b->epsilon) && 
++      eq(attrs_a->scale, attrs_b->scale) && eq(attrs_a->center, attrs_b->center);
++  }
++
++  // For now we assume all ops with same uprank having same number of ops like resnext
++  std::pair<bool, TOpPattern> AllTheSameOps(const std::vector<Expr>& arr_expr){
++    if(arr_expr.size() == 0) {
++      return std::make_pair(false, OpPatternKind::kOpaque);
++    }
++
++    bool all_same = true;
++    TOpPattern pattern;
++    if(arr_expr.front().as<CallNode>()) {
++      auto first_op = Downcast<Call>(arr_expr.front());
++      auto fpattern = Op::GetAttrMap<TOpPattern>("TOpPattern");
++      if(fpattern.count(Downcast<Op>(first_op->op))){
++        pattern = fpattern[Downcast<Op>(first_op->op)];
++        VLOG(1) << "GetOp " << first_op << " pattern: " << pattern;
++      }else{
++        VLOG(1) << "GetOp " << first_op << " cannot find pattern ";
++      }
++
++      for(size_t i=1; i<arr_expr.size(); ++i){
++        auto op = arr_expr[i];
++        if(first_op->attrs.as<Conv2DAttrs>()){
++          if(!op.as<CallNode>()->attrs.as<Conv2DAttrs>() || 
++            !CanConv2DOpsBeCombined(first_op.as<CallNode>(), op.as<CallNode>())){
++            all_same = false;
++            VLOG(1) << "Conv2d not same";
++            break;
++          }
++        }else if(Downcast<Op>(first_op->op)==Op::Get("nn.batch_norm")){
++          if(!op.as<CallNode>()->attrs.as<BatchNormAttrs>() || 
++            !CanBatchNorOpsBeCombined(first_op.as<CallNode>(), op.as<CallNode>())){
++            all_same = false;
++            pattern = OpPatternKind::kOpaque;
++            VLOG(1) << "batchnorm not same";
++            break;
++          }else{
++            pattern = OpPatternKind::kInjective;
++          }
++        }else if(fpattern[Downcast<Op>(op.as<CallNode>()->op)] != pattern ||
++          pattern > OpPatternKind::kInjective){
++            VLOG(1) << "call not same";
++          all_same = false;
++          break;
++        }
++      }
++    }else if(arr_expr.front().as<TupleGetItemNode>()){
++      for(size_t i=1; i<arr_expr.size(); ++i){
++        auto op = arr_expr[i];
++        pattern = OpPatternKind::kBroadcast;
++        if(!op.as<TupleGetItemNode>()){
++          all_same = false;
++          pattern = OpPatternKind::kOpaque;
++          VLOG(1) << "TupleGetItem not same";
++          break;
++        }
++      }
++    }
++    else {
++      LOG(INFO) << "Not implement for " << arr_expr.front();
++      all_same = false;
++      pattern = OpPatternKind::kOpaque;
++    }
++    return std::make_pair(all_same, pattern);
++  }
++
++  /**
++   * @brief Now we add batch_norm and relu, process layer by layer
++   * Call(conv2d)    Call(conv2d)
++   *    |               |
++   * Call(bn)        Call(bn)
++   *    |               |
++   * TupleGetItem(0) TupleGetItem(0)
++   *    |               |
++   * Call(relu)      Call(relu)
++   *    \               /
++   *         Tuple()
++   *           |
++   *     Call(concatenate)
++   * @return std::vector<Group> 
++   */
++  //TODO(Chunwei Xia) For now we assume all the fuseable ops having the same uprank
++  std::vector<Group> FindFusedConv2DBlocksV2_() {
++    std::vector<Group> can_be_fused_arr;
++    size_t last_uprank_size = 0;
++    Group g;
++    std::function<void()> handle_group = [&](){
++      if(!g.empty()){
++        can_be_fused_arr.push_back(g);
++        LOG(INFO) << "Create a group with branches: " << g.size();
++        g.clear(); 
++      }
++    };
++    // The we should sort the uprank_array_map based on the uprank
++    // First get the max uprank
++    size_t max_uprank = 0;
++    for(auto kv: graph_.uprank_array_map){
++      max_uprank = std::max(max_uprank, kv.first);
++    }
++    std::vector<std::vector<Expr>> arr_arr_expr(max_uprank+1);
++    for(auto kv: graph_.uprank_array_map){
++      arr_arr_expr[kv.first] = kv.second;
++    }
++    for(auto expr_with_same_uprank: arr_arr_expr){
++      if(expr_with_same_uprank.size() > 1) {
++        auto result = AllTheSameOps(expr_with_same_uprank);
++        VLOG(2) << result.first << " " << result.second;
++        // All the ops are the same
++        if(result.first){
++          // Conv2d like ops, try to fuse following ops to them
++          if(result.second > OpPatternKind::kInjective){ 
++            handle_group();
++            for(auto expr: expr_with_same_uprank){
++              g.push_back(Branch({expr}));
++            }
++            last_uprank_size = expr_with_same_uprank.size();
++          }else if(result.second <= OpPatternKind::kInjective){
++            // Fuse with last uprank
++            if(!g.empty()){
++              if(last_uprank_size == expr_with_same_uprank.size()){
++                size_t i=0;
++                for(auto expr: expr_with_same_uprank){
++                  g[i].push_back(expr);
++                  i++;
++                }
++                last_uprank_size = expr_with_same_uprank.size();
++              }else{
++                handle_group();
++                // TODO(Chunwei Xia) Add implementation to process more ops
++              }
++            }else{
++              LOG_FATAL << "Not support fusion starting from \
++                ops with OpPatternKind less than kBroadcast yet";
++            }
++          }else{
++            LOG_FATAL << "Not implement for this case";
++          }
++        }else{
++          //TODO(Chunwei Xia) Add implementation
++        }
++      }
++    }
++    handle_group();
++    LOG(INFO) << "Find " << can_be_fused_arr.size() << " groups for horizontal fusion";
++    return can_be_fused_arr;
++  }
++
++  //TODO(Chunwei Xia) For now we assume all the fuseable ops having the same uprank
++  // Now we add batch_norm and relu, process layer by layer
++  std::vector<Group> FindFusedConv2DOps_() {
++    std::vector<Group> can_be_fused_arr;
++    Group g;
++    for(auto it=graph_.uprank_array_map.begin(); it!=graph_.uprank_array_map.end(); ++it){
++      if(it->second.size() < 2){
++        continue;
++      }
++      auto first_op = it->second[0];
++      // For now we only fuse conv2d
++      auto call_node = first_op.as<CallNode>();
++      if(!call_node){
++        continue;
++      }
++      auto cond = call_node->attrs.as<Conv2DAttrs>();
++      if(!cond){
++        continue;
++      }
++      
++      for(size_t i=1; i<it->second.size(); ++i){
++        auto op = it->second[i];
++        if(op.as<CallNode>()->attrs.as<Conv2DAttrs>()){
++          if(CanConv2DOpsBeCombined(first_op.as<CallNode>(), op.as<CallNode>())){
++            g.push_back(Branch({op}));
++          }
++        }
++      }
++      g.push_back(Branch({first_op}));
++      VLOG(2) << "Find group with size " << g.size();
++      can_be_fused_arr.push_back(g);
++    }
++    return can_be_fused_arr;
++  }
++
++  Expr ConcatInputs(const Group& branches, size_t arg_index) {
++    Array<Expr> inputs;
++    for(auto branch: branches) {
++      auto conv2d = branch[0];
++      ICHECK(arg_index < Downcast<Call>(conv2d)->args.size());
++      inputs.push_back(Downcast<Call>(conv2d)->args[arg_index]);
++    }
++    return MakeConcatenate(Tuple(inputs), 0);
++  }
++
++  void DebugDumpInputVars_() {
++    std::ostringstream os;
++    for(auto var: graph_.input_vars_) {
++      os << var << " ";
++    }
++    VLOG(2) << "input vars: " << os.str() << "\n";
++  }
++};
++
++class GetArgsToBeReplaced : public ExprVisitor{
++public:
++  ExprSet GetArgs(){
++    return this->args_;
++  }
++
++  void VisitExpr_(const VarNode* op) {
++    this->args_.insert(GetRef<Var>(op));
++    ExprVisitor::VisitExpr_(op);
++  }
++  
++  void VisitExpr_(const ConstantNode* op) {
++    this->args_.insert(GetRef<Constant>(op));
++    ExprVisitor::VisitExpr_(op);
++  }
++
++  private:
++  ExprSet args_;
++};
++
++class HorizontalFuseMutator : private MixedModeMutator {
++  public:
++  
++  Expr Transform(const Expr body) {
++    support::Arena arena;
++    graph_ = UpwardRankGraph::Create(&arena, body);
++    // return Expr();
++    for(auto& g: graph_.groups){
++      if(g.size()<2){
++        continue;
++      }
++      // MakeCombinedOp(g);
++      VLOG(2) << "Branch start:";
++      for(auto expr: g[0]){
++        VLOG(2) << expr;
++      }
++      VLOG(2) << "Branch end";
++      MakeBlockCombinedOp(g);
++    }
++    for(auto kv: subst_map_){
++      LOG(INFO) << "replace: " << kv.first << " with: " << kv.second;
++    }
++    return this->Mutate(body);
++    // return ExprSubst(body, std::move(subst_map_));
++  }
++
++  Expr VisitExpr_(const FunctionNode* op) {
++    if(op->HasNonzeroAttr(attr::kPrimitive)) {
++      return GetRef<Expr>(op);
++    } else {
++      return ExprMutator::VisitExpr_(op);
++    }
++  }
++
++  Expr Rewrite_(const CallNode* call, const Expr& post) {
++    // First check whether it self needs to be replace
++    if(subst_map_.count(GetRef<Call>(call))){
++      return subst_map_[GetRef<Call>(call)];
++    }
++    // Second check whether his parents needs to be replace
++    bool changed = false;
++    Array<Expr> new_args;
++    for(auto& arg: call->args){
++      if(subst_map_.count(arg)){
++        new_args.push_back(subst_map_[arg]);
++        changed = true;
++      }else{
++        new_args.push_back(arg);
++      }
++    }
++    if(changed){
++      return Call(call->op, new_args, call->attrs);
++    }else{
++      return ExprMutator::VisitExpr_(call);
++    }
++  }
++
++  Expr Rewrite_(const TupleNode* tuple, const Expr& post) {
++    if(subst_map_.count(GetRef<Tuple>(tuple))){
++      return subst_map_[GetRef<Tuple>(tuple)];
++    }
++    Array<Expr> new_fields;
++    bool changed = false;
++    for(auto f: tuple->fields){
++      if(subst_map_.count(f)){
++        new_fields.push_back(subst_map_[f]);
++        changed = true;
++      }else{
++        new_fields.push_back(f);
++      }
++    }
++    if(changed){
++      return Tuple(new_fields);
++    }else{
++      return ExprMutator::VisitExpr_(tuple);
++    }
++  }
++
++  Expr Rewrite_(const TupleGetItemNode* tuple_get, const Expr& post) {
++    if(subst_map_.count(GetRef<TupleGetItem>(tuple_get))){
++      return subst_map_[GetRef<TupleGetItem>(tuple_get)];
++    }else{
++      return ExprMutator::VisitExpr_(tuple_get);
++    }
++  }
++  
++  //TODO(Chunwei Xia)
++  // Expr UpdateArg(){}
++
++  // Transform calls.
++  // Expr Rewrite_(const CallNode* call, const Expr& post) {
++  //   if(call->op.as<OpNode>()){
++  //     static auto fnoncomputational = Op::GetAttrMap<TNonComputational>("TNonComputational");
++  //     if(fnoncomputational.get(Downcast<Op>(call->op), false)){
++  //       return ExprMutator::VisitExpr_(call);
++  //     }else if(op2item.count(call)){
++  //       // Modify all children's argument
++  //       std::vector<const ExprNode*> children = graph_.getExprChildren(GetRef<Call>(call));
++  //       for(auto child: children){
++  //         if(child->IsInstance<CallNode>()){
++  //           auto child_call = Downcast<Call>(GetRef<Expr>(child));
++  //           Array<Expr> new_args;
++  //           for(const auto arg: child_call->args){
++  //             if(arg.as<CallNode>() && arg.as<CallNode>()==call){
++  //               new_args.push_back(op2item[call]);
++  //             }else{
++  //               new_args.push_back(arg);
++  //             }
++  //           }
++  //           auto new_child = Call(child_call->op, new_args, child_call->attrs, child_call->type_args, child_call->span);
++  //           VLOG(2) << "Make new_child " << new_child;
++  //           subst_map_.insert({GetRef<Expr>(child), new_child});
++  //         }else{
++  //           LOG(FATAL) << GetRef<Call>(call) << " Child is not call\n";
++  //           return ExprMutator::VisitExpr_(call);
++  //         }
++  //       }
++  //     }else{
++  //       return ExprMutator::VisitExpr_(call);
++  //     }
++  //   }
++  //   return ExprMutator::VisitExpr_(call);
++  // }
++
++  // Original we first concat inputs and weights so that
++  // at the TE stage we do not need to concat the weight
++  // and we only need to modify the tensor expression.
++  // But we plan to do more transformation at the te level,
++  // so in this pass we only put the fused ops in one function
++  // and does not change the original inputs
++  // TODO(Chunwei Xia) we need to find all the input and output ops of the block
++  Call MakeBlockCombinedOp(const Group& branches){
++    // 1. Make params and arguments of function (input op of the block) 
++    
++    ExprMap<Expr> var_constant_map;
++    auto getter = GetArgsToBeReplaced();
++    for(auto branch: branches){
++      getter.VisitExpr(branch.back());
++    }
++    Array<Var> params;
++    Array<Expr> arguments;
++    int index_param=0;
++    ExprMap<Expr> args_subst_map;
++    for(auto& expr: getter.GetArgs()){
++      VLOG(2) << "Expr to replace: " << expr;
++      arguments.push_back(expr);
++      auto new_var = Var("p_" + std::to_string(index_param), 
++            GetRef<tvm::TensorType>(expr->type_as<tvm::TensorTypeNode>()));
++      if(expr.as<ConstantNode>()){
++        var_constant_map.insert({new_var, expr});
++      }
++      params.push_back(new_var);
++      args_subst_map.insert({expr, new_var});
++      index_param++;
++    }
++    // 2. Make body of function (only need the output of the block)
++    Expr body;
++    tvm::Type ret_type;
++    auto result = graph_.IsGroupSinkToTuple_(branches);
++    if(result.first){
++      body = result.second;
++      VLOG(2) << body;
++    }else{
++      // We make a tuple node
++      Array<Expr> fields;
++      for(auto branch: branches){
++        fields.push_back(branch.back());
++      }
++      body = Tuple(fields);
++    }
++    auto new_body = ExprSubst(body, args_subst_map);
++    VLOG(2) << "new_body: " << new_body;
++    // TODO(Chunwei Xia) Check whether the tuple's child is concat
++    ret_type = GetRef<tvm::TupleType>(body->type_as<tvm::TupleTypeNode>());
++
++    // 3. Make the function and warp it to a call op
++    auto func = Function(params, new_body, ret_type, {});
++    func = WithAttr(std::move(func), attr::kFusion, tvm::Integer(1));
++    func = WithAttr(std::move(func), attr::kPrimitive, tvm::Integer(1));
++    // For fusing constant in lowerTE
++    Map<Expr, Expr> ref_var_constant_map(var_constant_map);
++    func = WithAttr(std::move(func), std::string("var_constant_map"), ref_var_constant_map);
++    auto new_call = Call(func, arguments, Attrs());
++
++    // 4. Feed the subst_map re-setup the relationship with the blocks's children
++    if(result.first){
++      if(graph_.parent_to_children_map_.count(body)){
++        subst_map_.insert({body, new_call});
++      }
++      // The concate is the output op, do nothing
++    }else{
++      // Create TupleGetItem op to get returned result from function
++      size_t i = 0;
++      for(auto& branch: branches){
++        auto last_op = branch.back();
++        subst_map_.insert({last_op, TupleGetItem(new_call, i)});
++      }
++    }
++
++    return new_call;
++  }
++
++  
++  Call MakeCombinedOp(const Group& branches) {
++    ICHECK(branches.size()>=2);
++    Array<Expr> inputs, weights, fields, pre_ops;
++    Array<IndexExpr> input_split_indices;
++    Array<IndexExpr> output_split_indices;
++    int32_t sum_of_input_channel = 0, sum_of_output_channel = 0;
++    // Get conv2d params
++    auto conv2d = branches[0][0].as<CallNode>();
++    auto batch = (int32_t)GetConv2DInputBatchDim(conv2d);
++    auto input_channels = (int32_t)GetConv2DInputChannelsDim(conv2d);
++    auto height = (int32_t)GetConv2DInputHeightDim(conv2d);
++    auto width = (int32_t)GetConv2DInputWidthDim(conv2d);
++    auto kernel_height = (int32_t)GetConv2DWeightKernelHeightDim(conv2d);
++    auto kernel_width = (int32_t)GetConv2DWeightKernelWidthDim(conv2d);
++    auto output_channels = (int32_t)GetConv2DSuperChannelsDim(conv2d);
++    auto input_dtype = GetConv2DInputDataType(conv2d);
++    auto weight_dtype = GetConv2DInputDataType(conv2d);
++    // Create arguments for function
++    for(auto branch: branches){
++      auto conv2d = branch[0].as<CallNode>();
++      ICHECK(conv2d->args.size()>=2);
++      inputs.push_back(conv2d->args[0]);
++      weights.push_back(conv2d->args[1]);
++      auto num_input_channel = (int32_t)GetConv2DInputChannelsDim(conv2d);
++      auto num_output_channel = (int32_t)GetConv2DSuperChannelsDim(conv2d);
++      sum_of_input_channel += num_input_channel;
++      sum_of_output_channel += num_output_channel;
++      if(input_split_indices.empty()){
++        input_split_indices.push_back(IndexExpr(num_input_channel));
++        output_split_indices.push_back(IndexExpr(num_output_channel));
++      }else{
++        input_split_indices.push_back(IndexExpr(num_input_channel) + input_split_indices.back());
++        output_split_indices.push_back(IndexExpr(num_output_channel) + output_split_indices.back());
++      }
++      pre_ops.push_back(GetRef<Call>(conv2d));
++    }
++    // Does not need last indices
++    input_split_indices.pop_back();
++    output_split_indices.pop_back();
++    //[1,3,5,5]*[2,3,1,1] ; [1,3,5,5]*[32,3,1,1]
++    // TODO(Chunwei Xia) Whether we concat at the batch axis or the channel axis
++    // Organize as group convolution
++    Array<PrimExpr> fn_input_shape = {
++      PrimExpr((int32_t)(batch * branches.size())), 
++      PrimExpr(input_channels), 
++      PrimExpr(height), 
++      PrimExpr(width)
++    };
++    Array<PrimExpr> fn_weight_shape = {
++      PrimExpr(sum_of_output_channel), 
++      PrimExpr(input_channels), 
++      PrimExpr(kernel_height), 
++      PrimExpr(kernel_width)
++    };
++    Array<PrimExpr> fn_output_shape = {
++      PrimExpr((int32_t)(batch * branches.size())), 
++      PrimExpr(output_channels), 
++      PrimExpr(height), 
++      PrimExpr(width)
++    };
++    Array<Var> params = {
++      Var("hfused_inputs", tvm::TensorType(fn_input_shape, input_dtype)), 
++      Var("hfused_weights", tvm::TensorType(fn_weight_shape, weight_dtype))
++    };
++    auto new_inputs = MakeConcatenate(Tuple(inputs), 0);
++    auto new_weights = MakeConcatenate(Tuple(weights), 0);
++    auto split_inputs = MakeSplit(params[0], Integer(branches.size()), 0);
++    auto split_weights = MakeSplit(params[1], Integer(branches.size()), 0);
++    // Modify ops in the body of function
++    int i = 0;
++    for(auto branch: branches) {
++      auto conv2d = branch[0].as<CallNode>();
++      Array<Expr> call_new_args = {TupleGetItem(split_inputs, (int32_t)i), TupleGetItem(split_weights, (int32_t)i)};
++      auto new_conv2d = Call(conv2d->op, call_new_args, conv2d->attrs, conv2d->type_args, conv2d->span);
++      fields.push_back(new_conv2d);
++      i++;
++    }
++    Array<Expr> arguments = {
++      new_inputs, 
++      new_weights
++    };
++    auto fn_ret = MakeConcatenate(Tuple(fields), 0);
++    auto func = Function(params, fn_ret, tvm::TensorType(fn_output_shape, input_dtype), {});
++    func = WithAttr(std::move(func), attr::kFusion, tvm::Integer(1));
++    func = WithAttr(std::move(func), attr::kPrimitive, tvm::Integer(1));
++    // Wrap function into CallNode
++    auto new_call = Call(func, arguments, Attrs());
++    // Add following split op
++    const int channel_dim = 0;
++    auto new_split = MakeSplit(new_call, Integer(branches.size()), channel_dim);
++    for(size_t i=0; i<fields.size(); ++i){
++      auto conv2d = pre_ops[i];
++      op2split.insert({conv2d.as<ExprNode>(), new_split});
++      op2item.insert({conv2d.as<ExprNode>(), TupleGetItem(new_split, (int32_t)i)});
++      subst_map_.insert({conv2d, fields[i]});
++    }
++    return Downcast<Call>(new_split);
++  }
++
++  private:
++  
++  UpwardRankGraph graph_;
++  std::unordered_map<const ExprNode*, Expr> op2split;
++  std::unordered_map<const ExprNode*, Expr> op2item;
++  /* \brief map of Expr to Expr to substitute it with after running pass */
++  ExprSubstMap subst_map_;
++};
++
++UpwardRankGraph UpwardRankGraph::Create(support::Arena* arena, const Expr& body){
++  return Creator(arena).Transform(body);
++}
++
++// Expr HorizontalFusion(const Expr& e) { return HoriFusionMutator().Transform(e); }
++Expr HorizontalFusion(const Expr e)  { 
++  return HorizontalFuseMutator().Transform(e);
++}
++
++namespace transform {
++
++Pass HorizontalFusion(int fuse_opt_level) {
++  runtime::TypedPackedFunc<Function(Function, IRModule, PassContext)> pass_func =
++      [=](Function f, IRModule m, PassContext pc) {
++        // return Downcast<Function>(HorizontalFusion(f));
++        VLOG(2) << "hfuse_opt_level: " << fuse_opt_level << ", pc->opt_level: " << pc->opt_level;
++        if(fuse_opt_level > pc->opt_level){
++          return Downcast<Function>(f);
++        }else{
++          return Downcast<Function>(HorizontalFusion(f));
++        }
++      };
++  return CreateFunctionPass(pass_func, 2, "HorizontalFusion", {"InferType"});
++}
++
++TVM_REGISTER_GLOBAL("relay._transform.HorizontalFusion").set_body_typed(HorizontalFusion);
++}  // namespace transform
++
++}  // namespace relay
++}  // namespace tvm
+diff --git a/src/relay/transforms/pattern_utils.h b/src/relay/transforms/pattern_utils.h
+index 03b8ee693..05773ed6e 100644
+--- a/src/relay/transforms/pattern_utils.h
++++ b/src/relay/transforms/pattern_utils.h
+@@ -208,6 +208,116 @@ inline int64_t GetConv2DSuperChannelsDim(const CallNode* call) {
+   return *channels;
+ }
+ 
++/*!
++ * \brief Get super-dimension of output channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of output channels of conv2d.
++ */
++inline int64_t GetConv2DWeightKernelHeightDim(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  auto tweight = call->args[1]->type_as<TensorTypeNode>();
++  auto index = param->kernel_layout.operator std::string().find('H');
++  ICHECK_NE(index, std::string::npos);
++  auto channels = tir::as_const_int(tweight->shape[index]);
++  return *channels;
++}
++
++/*!
++ * \brief Get super-dimension of output channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of output channels of conv2d.
++ */
++inline int64_t GetConv2DWeightKernelWidthDim(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  auto tweight = call->args[1]->type_as<TensorTypeNode>();
++  auto index = param->kernel_layout.operator std::string().find('W');
++  ICHECK_NE(index, std::string::npos);
++  auto channels = tir::as_const_int(tweight->shape[index]);
++  return *channels;
++}
++
++
++/*!
++ * \brief Get super-dimension of input channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of Input channels of conv2d.
++ */
++inline int64_t GetConv2DInputChannelsDim(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  auto tweight = call->args[0]->type_as<TensorTypeNode>();
++  auto index = param->data_layout.operator std::string().find('C');
++  ICHECK_NE(index, std::string::npos);
++  auto channels = tir::as_const_int(tweight->shape[index]);
++  return *channels;
++}
++
++/*!
++ * \brief Get super-dimension of input channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of Input channels of conv2d.
++ */
++inline int64_t GetConv2DInputBatchDim(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  auto tweight = call->args[0]->type_as<TensorTypeNode>();
++  auto index = param->data_layout.operator std::string().find('N');
++  ICHECK_NE(index, std::string::npos);
++  auto batch = tir::as_const_int(tweight->shape[index]);
++  return *batch;
++}
++
++/*!
++ * \brief Get super-dimension of input channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of Input channels of conv2d.
++ */
++inline int64_t GetConv2DInputHeightDim(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  auto tweight = call->args[0]->type_as<TensorTypeNode>();
++  auto index = param->data_layout.operator std::string().find('H');
++  ICHECK_NE(index, std::string::npos);
++  auto height = tir::as_const_int(tweight->shape[index]);
++  return *height;
++}
++
++/*!
++ * \brief Get super-dimension of input channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of Input channels of conv2d.
++ */
++inline int64_t GetConv2DInputWidthDim(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  auto tweight = call->args[0]->type_as<TensorTypeNode>();
++  auto index = param->data_layout.operator std::string().find('W');
++  ICHECK_NE(index, std::string::npos);
++  auto height = tir::as_const_int(tweight->shape[index]);
++  return *height;
++}
++
++/*!
++ * \brief Get super-dimension of input channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of Input channels of conv2d.
++ */
++inline DataType GetConv2DInputDataType(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  ICHECK(param);
++  auto tinput = call->args[0]->type_as<TensorTypeNode>();
++  return tinput->dtype;
++}
++
++/*!
++ * \brief Get super-dimension of input channels of conv2d
++ * \param call The conv2d call.
++ * \return Super-dimension size of Input channels of conv2d.
++ */
++inline DataType GetConv2DWeightDataType(const CallNode* call) {
++  auto param = call->attrs.as<Conv2DAttrs>();
++  ICHECK(param);
++  auto tweight = call->args[1]->type_as<TensorTypeNode>();
++  return tweight->dtype;
++}
++
++
+ /*!
+  * \brief Is single value tensor (scalar).
+  * \param expr The expr.
+diff --git a/src/relay/transforms/prim_expr_printer.cc b/src/relay/transforms/prim_expr_printer.cc
+new file mode 100644
+index 000000000..c8f4bcb4b
+--- /dev/null
++++ b/src/relay/transforms/prim_expr_printer.cc
+@@ -0,0 +1,125 @@
++
++/*!
++ * \file prim_expr_printer.cc
++ * \brief Utility to print the PrimExpr after lower and before schedule
++ */
++#include "prim_expr_printer.h"
++
++#include <tvm/runtime/registry.h>
++#include <tvm/tir/expr_functor.h>
++
++#include <set>
++
++namespace tvm {
++namespace relay {
++using namespace tir;
++
++class PrimExprPrinter : public ExprVisitor{
++  public:
++    PrimExprPrinter(): depth_{0} {}
++
++    void VisitExpr(const PrimExpr& node) final {
++      if(visited_.count(node.get()) != 0) return;
++      visited_.insert(node.get());
++
++      depth_++;
++      ExprVisitor::VisitExpr(node);
++      
++      depth_--;
++    }
++
++    // void VisitExpr_(const AddNode* op) final {
++    //   os_ << "tir.add(" << op->a << ", " << op->b << ")";
++    //   VisitExpr(op->a);
++    //   VisitExpr(op->b);
++    // }
++
++    void VisitExpr_(const AddNode* op) final {
++      os_ << "\ntir.add(\n";
++      VisitExpr(op->a);
++      os_ << ", \n";
++      VisitExpr(op->b);
++      os_ << ")\n";
++    }
++
++    void VisitExpr_(const MulNode* op) final {
++      os_ << "\ntir.mul(\n";
++      VisitExpr(op->a);
++      os_ << ", \n";
++      VisitExpr(op->b);
++      os_ << ")\n";
++    }
++
++    void VisitExpr_(const SelectNode* op) final {
++      os_ << "\ntir.select(condition\n";
++      VisitExpr(op->condition);
++      os_ << "true_value:\n";
++      VisitExpr(op->true_value);
++      os_ << "false_value:\n";
++      VisitExpr(op->false_value);
++      os_ << ")\n";
++    }
++
++    // void VisitExpr_(const MulNode* op) final {
++    //   os_ << "tir.mul(" << op->a << ", " << op->b << ")";
++    //   VisitExpr(op->a);
++    //   VisitExpr(op->b);
++    // }
++
++    void VisitExpr_(const ReduceNode* op) final {
++      os_ << "tir.reduce( reduce_axis: ";
++      for(const auto& var: op->axis) {
++        os_ << var;
++      } os_ << " source: " << op->source << ", combiner: " << op->combiner << ", condition " 
++        << op->condition << ", value_index: " << op->value_index << ")";
++      for(auto& expr: op->source){
++        VisitExpr(expr);
++      }
++    }
++
++    void VisitExpr_(const VarNode* op) final {
++      os_ << "tir.Var(" << op->name_hint << ")";
++    }
++
++    void VisitExpr_(const LoadNode* op) final {
++      os_ << "tir.Load(" << op->buffer_var << "[" << op->index << "]" << ")";
++    }
++
++    void VisitExpr_(const BufferLoadNode* op) final {
++      os_ << "tir.BufferLoad(" << op->buffer << "[\n";
++      for(auto& expr: op->indices){
++        VisitExpr(expr);
++      }
++      os_<<"]\n";
++    }
++
++    void VisitExpr_(const ProducerLoadNode* op) final {
++      os_ << "tir.ProducerLoad(" << op->producer << "[\n";
++      for(auto& expr: op->indices){
++        VisitExpr(expr);
++      }
++      os_<<"]\n";
++    }
++
++    void VisitExpr_(const IntImmNode* op) final {
++      os_ << "tir.IntImm(" << op->value << ")";
++    }
++
++    std::unordered_set<const Object*> visited_;
++    std::ostringstream os_;
++    size_t depth_;
++};
++
++void PrintPrimExpr(const PrimExpr& expr){
++  auto printer = PrimExprPrinter();
++  printer.VisitExpr(expr);
++  LOG(INFO) << printer.os_.str();
++}
++
++// TVM_REGISTER_GLOBAL("transform.PrintPrimExpr")
++//     .set_body_typed([](const PrimExpr& v) {
++//       return PrintPrimExpr(v);
++//     });
++
++}
++}
+\ No newline at end of file
+diff --git a/src/relay/transforms/prim_expr_printer.h b/src/relay/transforms/prim_expr_printer.h
+new file mode 100644
+index 000000000..4a526b9cb
+--- /dev/null
++++ b/src/relay/transforms/prim_expr_printer.h
+@@ -0,0 +1,16 @@
++
++
++#ifndef TVM_RELAY_TRANSFORMS_PRIM_EXPR_PRINTER_H
++#define TVM_RELAY_TRANSFORMS_PRIM_EXPR_PRINTER_H
++
++#include <tvm/tir/expr.h>
++
++namespace tvm {
++namespace relay {
++
++void PrintPrimExpr(const PrimExpr& expr);
++
++}
++}
++
++#endif
+\ No newline at end of file
+diff --git a/src/relay/transforms/prim_func_fusion_rewrite.cc b/src/relay/transforms/prim_func_fusion_rewrite.cc
+new file mode 100644
+index 000000000..d0d702a66
+--- /dev/null
++++ b/src/relay/transforms/prim_func_fusion_rewrite.cc
+@@ -0,0 +1,531 @@
++
++#include "prim_func_fusion_rewrite.h"
++
++#include <tvm/relay/analysis.h>
++#include <tvm/relay/expr_functor.h>
++#include <tvm/relay/attrs/nn.h>
++#include <tvm/relay/op_attr_types.h>
++#include <tvm/relay/transform.h>
++#include <tvm/tir/op.h>
++#include <tvm/te/operation.h>
++#include <tvm/tir/stmt_functor.h>
++#include <tvm/topi/transform.h>
++#include <tvm/tir/stmt.h>
++
++#include <queue>
++#include <vector>
++#include <unordered_map>
++#include <set>
++#include <utility>
++
++#include "../../support/arena.h"
++#include "expr_subst.h"
++#include "pattern_utils.h"
++
++namespace tvm {
++namespace relay {
++
++using namespace tvm::tir;
++
++// 1. Build relationship between ProducerLoad and Tensor (Tensor is the DataProducer of the ProducerLoad)
++// We can also obtain the PlaceholderOp throught the TE compute graph connected by tensors
++// ComputeOps connectted through input/output tensors
++// PrimExpr in ComputeOp's body also connected through tensors by ProducerLoad's producers
++// Therefore we can find which ProducerLoadOps consume a specific placeholder op
++class LoadTensorRelaionBuilder : public StmtExprVisitor {
++  public:
++  void Build(const PrimExpr& e) {
++    ExprVisitor::VisitExpr(e);
++  }
++
++  void PrintRelation() {
++    VLOG(2) << "PrimExpr -> Tensor:\n";
++    for(const auto& ele: this->load_tensor_map_){
++      VLOG(2) << ele.first << " -> " << ele.second ;
++    }
++    VLOG(2) << "Tensor -> PrimExpr:\n";
++    for(const auto& ele: this->tensor_load_map_){
++      std::stringstream os;
++      os << ele.first << " -> " << "[";
++      for(auto& load: ele.second){
++        os << load << ", ";
++      }
++      os << "]" ;
++      VLOG(2) << os.str();
++    }
++  }
++  
++  void VisitExpr_(const ProducerLoadNode* op) {
++    te::Tensor t = Downcast<te::Tensor>(op->producer);
++    // ICHECK(load_tensor_map_.count(GetRef<PrimExpr>(op)) == 0);
++    load_tensor_map_.insert({GetRef<PrimExpr>(op), t});
++    if(tensor_load_map_.count(t) == 0){
++      tensor_load_map_.insert({t, Array<PrimExpr>({GetRef<PrimExpr>(op)})});
++    }else{
++      tensor_load_map_[t].push_back(GetRef<PrimExpr>(op));
++    }
++    StmtExprVisitor::VisitExpr_(op);
++  }
++
++  // void VisitExpr_(const AddNode* op) {
++  //   this->VisitExpr(op->a);
++  //   this->VisitExpr(op->b);
++  // }
++
++  // void VisitExpr_(const SubNode* op) {
++  //   this->VisitExpr(op->a);
++  //   this->VisitExpr(op->b);
++  // }
++
++  // void VisitExpr_(const MulNode* op) {
++  //   this->VisitExpr(op->a);
++  //   this->VisitExpr(op->b);
++  // }
++
++  // void VisitExpr_(const ReduceNode* op) {
++  //   for(auto prim_expr: op->source){
++  //     this->VisitExpr(prim_expr);
++  //   }
++  // }
++
++  // void VisitExpr_(const SelectNode* op) {
++  //   VLOG(2) << "Visit SelectNode";
++  //   this->VisitExpr(op->condition);
++  //   this->VisitExpr(op->true_value);
++  //   this->VisitExpr(op->false_value);
++  // }
++
++  std::unordered_map<PrimExpr, te::Tensor, ObjectPtrHash, ObjectPtrEqual> load_tensor_map_;
++  std::unordered_map<te::Tensor, Array<PrimExpr>, ObjectPtrHash, ObjectPtrEqual> tensor_load_map_;
++};
++
++
++// 2. Build relationship between input tensor and output tensor
++class TERelationBuilder {
++  public:
++
++  void UpdateTensorMap_(const Array<te::Tensor>& inputs, const te::Tensor output_tensor){
++    for(const auto& input_tensor: inputs){
++      if(this->tinput_toutput_map.count(input_tensor) == 0){
++        this->tinput_toutput_map.insert({input_tensor, Array<te::Tensor>({output_tensor})});
++      }else{
++        this->tinput_toutput_map[input_tensor].push_back(output_tensor);
++      }
++      if(this->toutput_tinput_map.count(output_tensor) == 0){
++        this->toutput_tinput_map.insert({output_tensor, Array<te::Tensor>({input_tensor})});
++      }else{
++        this->toutput_tinput_map[output_tensor].push_back(input_tensor);
++      }
++    }
++  }
++
++  // Build relationship between the ComputeOp's input and output tensors of the whole TE graph
++  void Build(const Array<te::Tensor>& outputs) {
++    std::set<te::Operation> op_visited;
++    std::function<void(const Array<te::Tensor>&)> recursive_visitor = [&](const Array<te::Tensor>& outputs) {
++      for(auto& tensor: outputs){
++        if(op_visited.count(tensor->op)){
++          continue;
++        }
++        if(auto compute = tensor->op.as<te::ComputeOpNode>()){
++          for(auto prim_expr: compute->body){
++            this->load_tensor_builder.Build(prim_expr);
++            this->prim_expr_op_map.insert({prim_expr, tensor->op});
++          }
++          auto inputs = compute->InputTensors();
++          this->UpdateTensorMap_(inputs, tensor);
++          recursive_visitor(inputs);
++        }
++        // TODO(Chunwei Xia) May consider the PlaceholderOp
++      }
++    };
++    recursive_visitor(outputs);
++  }
++
++  // Get the rewrite tensor set, must first call Build
++  void GetRewriteTensorSet(const Array<te::Tensor>& inputs) {
++    // TODO(Chunwei Xia) May apply more precise dataflow analysis
++    for(auto input_tensor: inputs) {
++      if(this->rewrite_tensor_set_.count(input_tensor)){
++        continue;
++      }
++      this->rewrite_tensor_set_.insert(input_tensor);
++      VLOG(2) << "rewrite_tensor_set_ add" << input_tensor;
++      auto output_tensors = this->tinput_toutput_map[input_tensor];
++      GetRewriteTensorSet(output_tensors);
++    }
++  }
++
++  void PrintRelations() {
++    VLOG(2) << "PrimExpr -> ComputeOp:";
++    for(const auto& ele: this->prim_expr_op_map){
++      VLOG(2) << ele.first << " -> " << ele.second;
++    }
++    VLOG(2) << "Output Tensor -> Input Tensor";
++    for(const auto& ele: this->toutput_tinput_map){
++      VLOG(2) << ele.first << " -> " << ele.second;
++    }
++    VLOG(2) << "Input Tensor -> Output Tensor";
++    for(const auto& ele: this->tinput_toutput_map){
++      VLOG(2) << ele.first << " -> " << ele.second;
++    }
++    VLOG(2) << "Rewrite Tensor Set:";
++    for(const auto& tensor: this->rewrite_tensor_set_){
++      VLOG(2) << tensor ;
++    }
++    this->load_tensor_builder.PrintRelation();
++  }
++
++  LoadTensorRelaionBuilder load_tensor_builder;
++  // ProducerLoad to its computeOp
++  std::unordered_map<PrimExpr, te::Operation, ObjectPtrHash, ObjectPtrEqual> prim_expr_op_map;
++  std::unordered_map<te::Tensor, Array<te::Tensor>, ObjectPtrHash, ObjectPtrEqual> tinput_toutput_map;
++  std::unordered_map<te::Tensor, Array<te::Tensor>, ObjectPtrHash, ObjectPtrEqual> toutput_tinput_map;
++  // Set of tensors with relate ProducerLoadExpr need to be rewrite
++  std::set<te::Tensor> rewrite_tensor_set_;
++};
++
++
++
++// Modify a ComputeOp's ProducerLoad all related with specific tensor
++class ProduceLoadInseartIndiceRewriter : public StmtExprMutator {
++  public:
++  
++  ProduceLoadInseartIndiceRewriter(te::Var& var, const std::set<te::Tensor>& rewrite_tensor_set,
++    const std::unordered_map<te::Tensor, te::Tensor, ObjectPtrHash, ObjectPtrEqual>& replace_map)
++    : var_(var), rewrite_tensor_set_(rewrite_tensor_set),  replace_map_(replace_map) {
++      VLOG(2) << "ReplaceMap:";
++      for(const auto& ele: replace_map_){
++        VLOG(2) << ele.first << " -> " << ele.second;
++      }
++    }
++
++  PrimExpr Rewrite(PrimExpr expr) { 
++    VLOG(2) << "Start rewrite: " << expr;
++    return this->VisitExpr(expr); 
++  }
++
++
++  // PrimExpr Mutate(PrimExpr expr) {
++  //   return this->VisitExpr(expr);
++  // }
++
++  // Modify the ProducerLoad and it's producer at the same time
++  PrimExpr VisitExpr_(const ProducerLoadNode* op) final {
++    te::Tensor t = Downcast<te::Tensor>(op->producer);
++    if(this->rewrite_tensor_set_.count(t)) {
++      Array<PrimExpr> new_args = {this->var_};
++      for(auto arg: op->indices){
++        new_args.push_back(arg);
++      }
++      VLOG(2) << "DataProduce: "<< t;
++      ICHECK(replace_map_.count(t));
++      auto new_expr = ProducerLoad(replace_map_[t], new_args);
++      VLOG(2) << "NewProducerLoad: " << new_expr << " replace old " << t 
++        << ObjectPtrHash()(t) << " with " << replace_map_[t] << ObjectPtrHash()(replace_map_[t]);
++      return new_expr;
++    }
++    return GetRef<PrimExpr>(op);
++  }
++
++  // PrimExpr VisitExpr_(const AddNode* op) {
++  //   return tvm::tir::Add(this->VisitExpr(op->a), this->VisitExpr(op->b));
++  // }
++
++  // PrimExpr VisitExpr_(const SubNode* op) {
++  //   return tvm::tir::Sub(this->VisitExpr(op->a), this->VisitExpr(op->b));
++  // }
++
++  // PrimExpr VisitExpr_(const MulNode* op) {
++  //   return tvm::tir::Mul(this->VisitExpr(op->a), this->VisitExpr(op->b));
++  // }
++
++  // PrimExpr VisitExpr_(const ReduceNode* op) {
++  //   Array<PrimExpr> new_source;
++  //   for(auto prim_expr: op->source){
++  //     new_source.push_back(this->VisitExpr(prim_expr));
++  //   }
++  //   return tvm::tir::Reduce(op->combiner, new_source, op->axis, op->condition, op->value_index, op->init);
++  // }
++
++  // PrimExpr VisitExpr_(const SelectNode* op) {
++  //   return tvm::tir::Select(this->VisitExpr(op->condition), 
++  //     this->VisitExpr(op->true_value), this->VisitExpr(op->false_value));
++  // }
++
++  private:
++  tir::Var var_;
++  std::set<te::Tensor> rewrite_tensor_set_;
++  std::unordered_map<te::Tensor, te::Tensor, ObjectPtrHash, ObjectPtrEqual> replace_map_;
++};
++
++// TODO(Chunwei Xia)
++bool PlaceholderOpEqual(const te::PlaceholderOp& lhs, const te::PlaceholderOp& rhs){
++  bool equal = true;
++  equal &= (lhs->dtype == rhs->dtype) && (lhs->shape.size() == rhs->shape.size());
++  return equal;
++};
++
++
++
++
++// 3. Rewrite the relay graph and TE graph
++class PrimFuncFusionRewriteV2 : private ExprMutator {
++  public:
++  PrimFuncFusionRewriteV2(const Expr prim_func, ExprTEMap expr_te_map, TEExprMap te_expr_map, int32_t num_branch): 
++    prim_func_(prim_func),  num_branch_(num_branch), expr_te_map_(expr_te_map), te_expr_map_(te_expr_map) {};
++
++  std::pair<Expr, Array<te::Tensor>> Transform() {
++    // 1. Rewrite the original relay graph and get entry and exit tensors
++    auto expr = this->Mutate(prim_func_);
++    // 2.1 Build the input and output tensor relations from the exit tensors
++    relation_builder.Build(this->tensors_from_a_branch_);
++    // 2.2 Now we get all the tensors need to be rewrite from the entry tensors
++    relation_builder.GetRewriteTensorSet(this->tensors_from_split_);
++    relation_builder.PrintRelations();
++    // 3. Rewrite
++    this->PrintRelation();
++    auto output_tensors = this->RewriteTensors();
++    
++    return std::make_pair(expr, output_tensors);
++  }
++
++  // Rewrite recursively from the output tensor of the relay graph
++  te::Tensor RewriteComputeOp(te::Tensor output_tensor, std::string iter_var_name, int extent) {
++    if(auto compute = output_tensor->op.as<te::ComputeOpNode>()){
++      auto new_var = tir::Var(iter_var_name);
++      // (1) Rewrite ProducerLoadNode's indices in compute->body
++      auto pl_rewriter = ProduceLoadInseartIndiceRewriter(new_var, 
++        this->relation_builder.rewrite_tensor_set_, this->replace_map_);
++      Array<PrimExpr> new_body;
++      for(auto expr: compute->body){
++        VLOG(2) << "Rewrite: " << expr;
++        auto new_expr = pl_rewriter.Rewrite(expr);
++        VLOG(2) << " to-> " << new_expr;
++        new_body.push_back(new_expr);
++      }
++      // (2) Rewrite ComputeOp's axis
++      Array<IterVar> new_axis = {tir::IterVar(tvm::Range(0, extent), new_var, IterVarType::kDataPar)};
++      for(auto iter_var: compute->axis) {
++        new_axis.push_back(iter_var);
++      }
++      // Original topi workload will mark the conv2d in attrs like this:
++      // attrs={"workload": ["conv2d_nchw.cuda", ["TENSOR", [1, 3, 8, 8], "float32"],
++      // ["TENSOR", [2, 3, 3, 3], "float32"], [1, 1], [1, 1, 1, 1], [1, 1], "float32"]}
++      // We will remove the attrs
++      Map<String, ObjectRef> new_attrs;
++      if (compute->tag=="conv2d_nchw") {
++        new_attrs = {};
++      }else {
++        new_attrs = compute->attrs;
++      }
++      auto new_compute = te::ComputeOp(compute->name, compute->tag, new_attrs, new_axis, new_body);
++      // (3) Rewrite Tensor's shape and op
++      auto new_shape = Array<PrimExpr>({extent});
++      for(auto s: output_tensor->shape){
++        new_shape.push_back(s);
++      }
++      auto new_tensor = te::Tensor(new_shape, output_tensor->dtype, new_compute, output_tensor->value_index);
++      return new_tensor;
++    }
++    return output_tensor;
++  }
++
++  // Rewrite all the tensors, it's op and op's primExpr
++  Array<te::Tensor> RewriteTensors(){
++    // Using BFS to rewrite from input to output
++    std::queue<te::Tensor> queue_tensor;
++    std::set<te::Tensor> added;
++    auto funique_push_to_queue = [&added, &queue_tensor](const auto& tensor) {
++      if(added.count(tensor) == 0){
++        queue_tensor.push(tensor);
++        added.insert(tensor);
++      }
++    };
++    for(auto& tensor: this->tensors_from_split_) {
++      auto new_shape = Array<PrimExpr>({this->num_branch_});
++      for(auto s: tensor->shape) {
++        new_shape.push_back(s);
++      }
++      auto new_tensor = te::Tensor(new_shape, tensor->dtype, tensor->op, tensor->value_index);
++      this->replace_map_.insert({tensor, new_tensor});
++      ICHECK(relation_builder.tinput_toutput_map.count(tensor));
++      for(auto& output: relation_builder.tinput_toutput_map[tensor]){
++        VLOG(2) << "relation_builder.tinput_toutput_map[tensor]" << tensor << " -> " << output;
++        funique_push_to_queue(output);
++      }
++    }
++    
++    std::set<te::Tensor> visisted;
++    while(!queue_tensor.empty()) {
++      auto output_tensor = queue_tensor.front();
++      queue_tensor.pop();
++      if(visisted.count(output_tensor)) {
++        continue;
++      }
++      visisted.insert(output_tensor);
++      /**
++       * 
++       * output_tensor (first compute op after split)
++       */
++      // Get ouput_tensor's parent, if it's in spilt, then replace the input tensor with
++      for(auto split_tensor: relation_builder.toutput_tinput_map[output_tensor]){
++        if(this->split_to_var_tensor_map_.count(split_tensor)){
++          auto& placeholder_tensor = this->split_to_var_tensor_map_[split_tensor];
++          VLOG(2) << "placeholder_tensor: " << placeholder_tensor;
++          Array<PrimExpr> new_shape = {PrimExpr(num_branch_), 
++          PrimExpr((int32_t)placeholder_tensor->shape[0].as<IntImmNode>()->value / num_branch_)};
++          for(size_t i = 1; i<placeholder_tensor->shape.size(); ++i){
++            new_shape.push_back(placeholder_tensor->shape[i]);
++          }
++          this->replace_map_[split_tensor] = tvm::topi::reshape(placeholder_tensor, new_shape);
++          VLOG(2) << "Connected with PlaceHolder " << placeholder_tensor 
++            << " hash: " << ObjectHash()(placeholder_tensor) 
++            << " new_output_tensor " << this->replace_map_[split_tensor] ;
++        }
++      }
++      
++      VLOG(2) << "rewirte_output_tensor" << output_tensor;
++      auto new_output_tensor = this->RewriteComputeOp(output_tensor, "g", num_branch_);
++      this->replace_map_[output_tensor] = new_output_tensor;
++      // If we rewrite split tensor, 
++      // we will insert topi::reshape between the new split_tensor and Placeholder
++      
++      if(relation_builder.tinput_toutput_map.count(output_tensor)) {
++        for(auto& child_tensor: relation_builder.tinput_toutput_map[output_tensor]) {
++          funique_push_to_queue(child_tensor);
++        }
++      }
++    }
++    Array<te::Tensor> new_output_tensor;
++    for(auto output: this->tensors_from_a_branch_){
++      new_output_tensor.push_back(this->replace_map_[output]);
++    }
++
++    return new_output_tensor;
++  }
++
++  void PrintMemo(){
++    VLOG(2) << "Mutate memo:";
++    for(auto ele: this->memo_) {
++      VLOG(2) << ele.first << " -> " << ele.second;
++    }
++  }
++
++  // TODO (Chunwei Xia) Deal with concat
++  Expr VisitExpr_(const CallNode* op) {
++    // Is the return expr of the Function
++    if(GetRef<Expr>(op) == this->func_return_expr_ && op->op == Op::Get("concatenate")) {
++      VLOG(2) << "Get func_return_expr && Get concatenate";
++      ICHECK(op->args.size()==1);
++      auto result = this->VisitExpr(op->args[0]);
++      VLOG(2) << "result: " << result;
++      return result;
++    }
++    for(auto arg: op->args) {
++      this->VisitExpr(arg);
++    }
++    return GetRef<Expr>(op);
++  }
++
++  Expr VisitExpr_(const FunctionNode* op) {
++    VLOG(2) << "FunctionNode: " << GetRef<Expr>(op);
++    this->func_return_expr_ = op->body;
++    return Function(op->params, this->VisitExpr(op->body), op->ret_type, op->type_params, op->attrs, op->span);
++  }
++
++  // TODO(Chunwei Xia) Add reshape op
++  Expr VisitExpr_(const TupleGetItemNode* op) {
++    VLOG(2) << "TupleGetItemNode: " << GetRef<Expr>(op);
++    if(auto call_op = op->tuple.as<CallNode>()){
++      if(call_op->op == Op::Get("split") 
++        && call_op->args.size() == 1 
++        && call_op->args[0].as<VarNode>()){
++        VLOG(2) << "Find branch entry";
++        for(auto split_tensor: expr_te_map_[GetRef<Expr>(op)]) {
++          tensors_from_split_.push_back(split_tensor);
++          // Placeholder tensor
++          for(auto placeholder_tensor: expr_te_map_[call_op->args[0]]){
++            split_to_var_tensor_map_.insert({split_tensor, placeholder_tensor});
++          }
++        }
++      }
++    }
++    return GetRef<Expr>(op);
++  }
++
++  // TODO(Chunwei Xia) For Now we assume all the branches are equal
++  Expr VisitExpr_(const TupleNode* op) {
++    VLOG(2) << "TupleNode: " << GetRef<Expr>(op);
++    if (op->fields.size() == 1) {
++      return GetRef<Expr>(op);
++    }
++    auto f0 = op->fields[0];
++    bool all_equal = true;
++    // TODO(Chunwei Xia) Find how to compare relay graph equal
++    for(auto f: op->fields) {
++      all_equal = all_equal && StructuralEqual()(f0, f);
++    }
++    tensors_from_a_branch_ = expr_te_map_[f0];
++    // ICHECK(all_equal);
++    return this->VisitExpr(f0);
++  }
++
++  void PrintRelation() {
++    VLOG(2) << "tensors from split:";
++    for(auto t: this->tensors_from_split_){
++      VLOG(2) << t;
++    }
++    VLOG(2) << "Tensors from a branch:";
++    for(auto t: this->tensors_from_a_branch_){
++      VLOG(2) << t;
++    }
++    VLOG(2) << "split_to_var_tensor_map_:";
++    for(auto ele: this->split_to_var_tensor_map_){
++      VLOG(2) << ele.first << " -> " << ele.second;
++    }
++  }
++
++  public:
++  // The Function marked with kFusion to be rewrite
++  Expr prim_func_;
++  // The number of branch
++  int32_t num_branch_;
++  // Tensors produced by the split op
++  Array<te::Tensor> tensors_from_split_;
++  // Record the tensor produced by split node to it's parent placeholder,
++  // then at the mutate stage we inseart reshape op between them
++  std::unordered_map<te::Tensor, te::Tensor, ObjectPtrHash, ObjectPtrEqual> split_to_var_tensor_map_;
++  // Tensors produced by the end op of a branch
++  Array<te::Tensor> tensors_from_a_branch_;
++  // Tensor replace map
++  std::unordered_map<te::Tensor, te::Tensor, ObjectPtrHash, ObjectPtrEqual> replace_map_;
++  // The return expr of the prim_func_
++  Expr func_return_expr_;
++  TERelationBuilder relation_builder;
++  ExprTEMap expr_te_map_;
++  TEExprMap te_expr_map_;
++};
++
++std::pair<Expr, Array<te::Tensor>> RewriteFusedPrimFunc(const Expr prim_func, ExprTEMap expr_te_map,
++  TEExprMap te_expr_map, int32_t num_branch) {
++  // return PrimFuncFusionRewrite(prim_func, expr_te_map, te_expr_map).Transform();
++  return PrimFuncFusionRewriteV2(prim_func, expr_te_map, te_expr_map, num_branch).Transform();
++}
++
++
++
++// Recursively visit computeOp's input tensors
++void PrintTEGraph(te::Tensor tensor){
++  if(auto compute = tensor->op.as<te::ComputeOpNode>()){
++    VLOG(2) << tensor->op ;
++    for(auto t: compute->InputTensors()){
++      PrintTEGraph(t);
++    }
++  }else if(auto placeholder = tensor->op.as<te::PlaceholderOpNode>()) {
++    VLOG(2) << placeholder->name << " " << tensor;
++  }
++}
++
++}
++}
+\ No newline at end of file
+diff --git a/src/relay/transforms/prim_func_fusion_rewrite.h b/src/relay/transforms/prim_func_fusion_rewrite.h
+new file mode 100644
+index 000000000..b8465881e
+--- /dev/null
++++ b/src/relay/transforms/prim_func_fusion_rewrite.h
+@@ -0,0 +1,19 @@
++#ifndef PRIM_FUNC_FUSION_REWRITE_H
++#define PRIM_FUNC_FUSION_REWRITE_H
++
++#include <tvm/relay/transform.h>
++#include <tvm/tir/op.h>
++
++namespace tvm {
++namespace relay {
++  using ExprTEMap = std::unordered_map<relay::Expr, Array<te::Tensor>, ObjectPtrHash, ObjectPtrEqual>;
++  using TEExprMap = std::unordered_map<te::Tensor, relay::Expr, ObjectPtrHash, ObjectPtrEqual>;
++  
++  std::pair<Expr, Array<te::Tensor>> RewriteFusedPrimFunc(const Expr prim_func, ExprTEMap expr_te_map,
++  TEExprMap te_expr_map, int32_t num_branch);
++  void PrintTEGraph(te::Tensor tensor);
++  Array<te::Tensor> FFusionTensorExpression(Array<te::Tensor> outputs);
++}
++}
++
++#endif
+\ No newline at end of file
+diff --git a/src/runtime/cuda/cuda_module.cc b/src/runtime/cuda/cuda_module.cc
+index 7d6879a62..ecbec2a96 100644
+--- a/src/runtime/cuda/cuda_module.cc
++++ b/src/runtime/cuda/cuda_module.cc
+@@ -31,6 +31,9 @@
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
++#include <iostream>
++#include <fstream>
++#include <streambuf>
+ 
+ #include "../file_utils.h"
+ #include "../meta_data.h"
+@@ -172,6 +175,8 @@ class CUDAWrappedFunc {
+     CUresult result = cuLaunchKernel(fcache_[device_id], wl.grid_dim(0), wl.grid_dim(1),
+                                      wl.grid_dim(2), wl.block_dim(0), wl.block_dim(1),
+                                      wl.block_dim(2), wl.dyn_shmem_size, strm, void_args, nullptr);
++    // LOG(INFO) << m_->GetSource("cu");
++    
+     if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED) {
+       const char* msg;
+       cuGetErrorName(result, &msg);
+@@ -189,6 +194,19 @@ class CUDAWrappedFunc {
+       }
+       LOG(FATAL) << os.str();
+     }
++    std::ostringstream os;
++    os << " // grid=(" << wl.grid_dim(0) << "," << wl.grid_dim(1) << "," << wl.grid_dim(2) << "), "
++       << " block=(" << wl.block_dim(0) << "," << wl.block_dim(1) << "," << wl.block_dim(2)
++       << ")\n";
++    VLOG(0) << os.str() << m_->GetSource("cu");
++
++    std::ifstream t("/tmp/tvm_name_cuda_code");
++    std::string file_name((std::istreambuf_iterator<char>(t)),
++                    std::istreambuf_iterator<char>());
++    VLOG(0) << file_name;
++    std::ofstream out(file_name);
++    out << os.str() << m_->GetSource("cu");
++    out.close();
+   }
+ 
+  private:
+diff --git a/src/target/opt/build_cuda_on.cc b/src/target/opt/build_cuda_on.cc
+index 4a2917daa..7fd8868e4 100644
+--- a/src/target/opt/build_cuda_on.cc
++++ b/src/target/opt/build_cuda_on.cc
+@@ -107,7 +107,10 @@ std::string NVRTCCompile(const std::string& code, bool include_path = false) {
+   }
+   NVRTC_CALL(nvrtcCreateProgram(&prog, code.c_str(), nullptr, 0, nullptr, nullptr));
+   nvrtcResult compile_res = nvrtcCompileProgram(prog, param_cstrings.size(), param_cstrings.data());
+-
++  printf("cuda compile flags: ");
++  for(auto cs: param_cstrings){
++    printf("%s", cs);
++  }printf("\n");
+   size_t log_size;
+   NVRTC_CALL(nvrtcGetProgramLogSize(prog, &log_size));
+   std::string log;
+diff --git a/src/te/operation/compute_op.cc b/src/te/operation/compute_op.cc
+index c73a6e0ce..70aaab901 100644
+--- a/src/te/operation/compute_op.cc
++++ b/src/te/operation/compute_op.cc
+@@ -270,6 +270,7 @@ Stmt BaseComputeOpNode::BuildRealize(const Stage& stage,
+   for (int i = this->num_outputs(); i > 0; --i) {
+     Tensor t = stage->op.output(i - 1);
+     realize = tir::ProducerRealize(t, bounds, const_true(), realize, storage_scope);
++    // VLOG(2) << "BuildRealize output: " << i << " " << realize;
+     // alignment requirement, only useful for compute
+     for (size_t i = 0; i < num_schedulable_dims(); ++i) {
+       auto it = stage->iter_var_attrs.find(this->axis[i]);
+@@ -285,6 +286,7 @@ Stmt BaseComputeOpNode::BuildRealize(const Stage& stage,
+       }
+     }
+   }
++  // VLOG(2) << "BuildRealize return: " << realize;
+   return realize;
+ }
+ 
+diff --git a/src/te/schedule/message_passing.h b/src/te/schedule/message_passing.h
+index c382b90d6..8eda1f174 100644
+--- a/src/te/schedule/message_passing.h
++++ b/src/te/schedule/message_passing.h
+@@ -115,7 +115,15 @@ std::vector<PrimExpr> MakeBoundCheck(const Stage& stage, const Map<IterVar, Rang
+                                      const std::unordered_map<IterVar, PrimExpr>& value_map,
+                                      bool skip_ivar_domain,
+                                      const std::unordered_set<IterVar>& skip_iter);
+-
++/**
++ * @brief Check whether Range input_1 is equal to input_2
++ * 
++ * @param input_1 
++ * @param input_2 
++ * @return true 
++ * @return false 
++ */
++bool IsRangeSame(const Range input_1, const Range input_2);
+ }  // namespace te
+ }  // namespace tvm
+ #endif  // TVM_TE_SCHEDULE_MESSAGE_PASSING_H_
+diff --git a/src/te/schedule/schedule_dataflow_rewrite.cc b/src/te/schedule/schedule_dataflow_rewrite.cc
+index fae826b92..cb11c08ab 100644
+--- a/src/te/schedule/schedule_dataflow_rewrite.cc
++++ b/src/te/schedule/schedule_dataflow_rewrite.cc
+@@ -30,6 +30,7 @@
+ #include "../../tir/transforms/ir_utils.h"
+ #include "message_passing.h"
+ #include "operation_inline.h"
++#include "message_passing.h"
+ 
+ namespace tvm {
+ namespace te {
+@@ -440,6 +441,9 @@ Array<Tensor> Schedule::cache_write(const Array<Tensor>& tensor_array, const std
+   ICHECK(tensor_array.size() > 0) << "size of tensor_array must be greater than 0";
+   Tensor tensor = tensor_array[0];
+   Stage orig_stage = operator[](tensor->op);
++  for(const auto& t: tensor_array){
++    VLOG(2) << t->op;
++  }
+   const ComputeOpNode* compute = tensor->op.as<ComputeOpNode>();
+   ICHECK(static_cast<size_t>(compute->num_outputs()) == tensor_array.size())
+       << "size of input tensor list must be same as number of stage outputs";
+@@ -518,6 +522,7 @@ void InjectInline(ScheduleNode* sch, bool feature_extraction_mode) {
+       stage->attach_type = kInlinedAlready;
+       Array<Var> args;
+       PrimExpr body;
++      Array<IterVar> axis_inline;
+       {
+         // setup args
+         const ComputeOpNode* compute = stage->op.as<ComputeOpNode>();
+@@ -525,6 +530,7 @@ void InjectInline(ScheduleNode* sch, bool feature_extraction_mode) {
+         for (auto iv : compute->axis) {
+           args.push_back(iv->var);
+         }
++        axis_inline = compute->axis;
+         ICHECK_EQ(compute->body.size(), 1U) << "can only inline compute op with 1 output";
+ 
+         if (feature_extraction_mode && compute->attrs.count("const_matrix")) {
+@@ -556,6 +562,7 @@ void InjectInline(ScheduleNode* sch, bool feature_extraction_mode) {
+             PrimExpr new_value = Inline(tir::Evaluate(new_body[j][0]), stage->op, args, body)
+                                      .as<tir::EvaluateNode>()
+                                      ->value;
++            // VLOG(2) << "new_value: " << new_value;
+             if (!new_value.same_as(new_body[j][0])) {
+               changed[j] = true;
+               const tir::ReduceNode* r = new_value.as<tir::ReduceNode>();
+@@ -569,10 +576,15 @@ void InjectInline(ScheduleNode* sch, bool feature_extraction_mode) {
+               }
+             }
+           } else {
++            // ICHECK(axis_inline.size() == compute->axis.size());
++            // for(size_t a = 0; a < axis_inline.size(); ++a){
++            //   ICHECK(IsRangeSame(axis_inline[0]->dom, compute->axis[0]->dom));
++            // }
+             for (size_t k = 0; k < new_body[j].size(); ++k) {
+               PrimExpr new_value = Inline(tir::Evaluate(new_body[j][k]), stage->op, args, body)
+                                        .as<tir::EvaluateNode>()
+                                        ->value;
++              // VLOG(2) << "new_value: " << new_value;
+               if (!new_value.same_as(new_body[j][k])) {
+                 new_body[j].Set(k, new_value);
+                 changed[j] = true;
+@@ -612,6 +624,7 @@ void InjectInline(ScheduleNode* sch, bool feature_extraction_mode) {
+         }
+         s->op = op;
+       }
++      // VLOG(2) << "new_op: " << s->op;
+     } else if (hybrid_changed[i]) {
+       const HybridOpNode* hybrid = sch->stages[i]->op.as<HybridOpNode>();
+       ICHECK(hybrid);
+diff --git a/src/te/schedule/schedule_ops.cc b/src/te/schedule/schedule_ops.cc
+index 825092d20..c189ba3d4 100644
+--- a/src/te/schedule/schedule_ops.cc
++++ b/src/te/schedule/schedule_ops.cc
+@@ -43,6 +43,7 @@ using namespace tir;
+ Stmt MakePipeline(const Stage& s, const std::unordered_map<IterVar, Range>& dom_map, Stmt consumer,
+                   bool debug_keep_trivial_loop) {
+   Stmt producer = s->op->BuildProvide(s, dom_map, debug_keep_trivial_loop);
++  // VLOG(2) << "producer: " << producer;
+   if (s->double_buffer) {
+     producer = AttrStmt(s->op, tir::attr::double_buffer_scope, 1, producer);
+   }
+@@ -51,8 +52,10 @@ Stmt MakePipeline(const Stage& s, const std::unordered_map<IterVar, Range>& dom_
+   if (consumer.defined() && !is_no_op(consumer)) {
+     pipeline = SeqStmt({producer, consumer});
+   }
+-
+-  return s->op->BuildRealize(s, dom_map, pipeline, s->scope);
++  // VLOG(2) << "pipeline: " << producer;
++  auto result = s->op->BuildRealize(s, dom_map, pipeline, s->scope);
++  // VLOG(2) << "MakePipeline return: " << result;
++  return result;
+ }
+ 
+ // inject the operator's realization on the stmt.
+@@ -313,6 +316,9 @@ class SchedulePostProc : public StmtExprMutator {
+ };
+ 
+ Stmt ScheduleOps(Schedule sch, Map<IterVar, Range> dom_map_, bool debug_keep_trivial_loop) {
++  for(auto dom: dom_map_){
++    VLOG(0) << dom.first << " range " << dom.second;
++  }
+   Stmt body = Stmt();
+   std::unordered_map<IterVar, Range> dom_map = as_unordered_map(dom_map_);
+   // scan init and scan updates
+@@ -337,6 +343,7 @@ Stmt ScheduleOps(Schedule sch, Map<IterVar, Range> dom_map_, bool debug_keep_tri
+   // reverse the post DFS order.
+   for (size_t i = sch->stages.size(); i != 0; --i) {
+     Stage s = sch->stages[i - 1];
++    VLOG(2) << "Stage: " << s;
+     ICHECK_NE(s->attach_type, kInline) << "call schedule.normalize before scheduleops";
+     ICHECK(s->op.defined());
+     // no need to specify place holder op.
+@@ -358,13 +365,17 @@ Stmt ScheduleOps(Schedule sch, Map<IterVar, Range> dom_map_, bool debug_keep_tri
+     } else if (attach_spec->attach_type == kInlinedAlready) {
+       // do nothing
+     } else if (attach_spec->attach_type == kGroupRoot) {
++      VLOG(2) << "MakePipeline op: " << s->op;
+       ICHECK(!s->group.defined());
+       body = MakePipeline(s, dom_map, body, debug_keep_trivial_loop);
++      VLOG(2) << "MakePipeline body: " << body;
+     } else {
+       ICHECK_EQ(attach_spec->attach_type, kScope);
+       ICHECK(body.defined());
++      VLOG(2) << "InjectAttach op: " << s->op;
+       InjectAttach mutator(s, attach_spec, dom_map, debug_keep_trivial_loop);
+       body = mutator(std::move(body));
++      VLOG(2) << "InjectAttach body: " << body;
+       ICHECK(mutator.found_attach)
+           << "did not find attachment point for " << s << " in " << attach_spec->attach_stage->op
+           << " x " << attach_spec->attach_ivar << ", body:\n"
+diff --git a/src/te/schedule/schedule_postproc_to_primfunc.cc b/src/te/schedule/schedule_postproc_to_primfunc.cc
+index 439d0ff17..826fb5eed 100644
+--- a/src/te/schedule/schedule_postproc_to_primfunc.cc
++++ b/src/te/schedule/schedule_postproc_to_primfunc.cc
+@@ -45,6 +45,8 @@
+ #include <unordered_map>
+ #include <utility>
+ 
++#include "../../tir/transforms/replace_tensors_in_expr_stmt.h"
++
+ namespace tvm {
+ namespace te {
+ 
+@@ -102,8 +104,9 @@ class TensorToBufferMapper : public StmtExprMutator {
+ 
+   Stmt VisitStmt_(const ProducerStoreNode* op) final {
+     Tensor tensor = Downcast<Tensor>(op->producer);
++    VLOG(2) << "ProducerStoreNode start " << GetRef<ProducerStore>(op);
+     Buffer buffer = GetBuffer(tensor);
+-
++    VLOG(2) << "ProducerStoreNode end " << GetRef<ProducerStore>(op);
+     auto ret = StmtExprMutator::VisitStmt_(op);
+     op = ret.as<ProducerStoreNode>();
+ 
+@@ -114,7 +117,9 @@ class TensorToBufferMapper : public StmtExprMutator {
+     auto ret = StmtExprMutator::VisitExpr_(op);
+     op = ret.as<ProducerLoadNode>();
+     Tensor tensor = Downcast<Tensor>(op->producer);
++    VLOG(2) << "ProducerLoadNode start " << GetRef<ProducerLoad>(op);
+     Buffer buffer = GetBuffer(tensor);
++    VLOG(2) << "ProducerLoadNode end " << GetRef<ProducerLoad>(op);
+     return tir::BufferLoad(buffer, op->indices);
+   }
+ 
+@@ -124,7 +129,18 @@ class TensorToBufferMapper : public StmtExprMutator {
+   }
+ 
+   Buffer GetBuffer(const Tensor& tensor, String storage_scope = "", bool allow_alloc = false) {
++    VLOG(2) << "{";
++    for(auto& ele: this->buffer_map_){
++      VLOG(2) << ele.first << " hash: " << ObjectPtrHash()(ele.first) << " -> " << ele.second;
++    }
+     auto it = buffer_map_.find(tensor);
++    if(it == buffer_map_.end()) {
++      VLOG(2) << "bugger_map_ cannot find tensor" << tensor;
++      if(!allow_alloc){
++        VLOG(2) << "Bug here!" << tensor << " hash: " << ObjectPtrHash()(tensor) << " op: " << Downcast<PlaceholderOp>(tensor->op);
++      }
++    }
++    VLOG(2) << "}";
+     if (it != buffer_map_.end()) return it->second;
+     ICHECK(allow_alloc) << "Cannot find the Realization point of tensor " << tensor;
+ 
+@@ -155,6 +171,8 @@ PrimFunc SchedulePostProcToPrimFunc(Array<ObjectRef> arg_list, Stmt body,
+     } else if (auto* n = var.as<te::TensorNode>()) {
+       te::Tensor tensor = GetRef<te::Tensor>(n);
+       ICHECK(!extern_buffer.count(tensor));
++      VLOG(2) << tensor << " op: " << tensor->op;
++      tvm::tir::transforms::FVerifyTensorConnect(tensor);
+ 
+       tir::Buffer buffer = CreateBufferFor(tensor);
+       tir::Var bptr(buffer->name, PrimType(DataType::Handle()));
+@@ -168,7 +186,9 @@ PrimFunc SchedulePostProcToPrimFunc(Array<ObjectRef> arg_list, Stmt body,
+       buffer_map.Set(bptr, buffer);
+     }
+   }
+-
++  // for(auto& ele: extern_buffer){
++  //   VLOG(2) << ele.first << " -> " << ele.second;
++  // }
+   body = TensorToBufferMapper(std::move(extern_buffer))(std::move(body));
+   // We mark this PrimFunc as coming from a TE schedule
+   return WithAttr(tir::PrimFunc(params, body, VoidType(), buffer_map), "from_legacy_te_schedule",
+diff --git a/src/tir/transforms/replace_tensors_in_expr_stmt.cc b/src/tir/transforms/replace_tensors_in_expr_stmt.cc
+new file mode 100644
+index 000000000..d4d90fdf4
+--- /dev/null
++++ b/src/tir/transforms/replace_tensors_in_expr_stmt.cc
+@@ -0,0 +1,126 @@
++#include "replace_tensors_in_expr_stmt.h"
++
++#include <set>
++
++namespace tvm{
++namespace tir{
++namespace transforms{
++using namespace tvm::tir;
++
++
++// TODO(Chunwei Xia) For now we only condier ProducerLoad and ProducerStore
++class GetTensorsFromStmtExpr : public StmtExprVisitor {
++  public:
++
++  void VisitExpr_(const ProducerLoadNode* op) final {
++    auto tensor = Downcast<te::Tensor>(op->producer);
++    VLOG(1) << GetRef<ProducerLoad>(op) << " tensor: " << tensor << " hash: " << ObjectPtrHash()(tensor);
++    used_tensors_.insert(tensor);
++    StmtExprVisitor::VisitExpr_(op);
++  }
++
++  void VisitStmt_(const ProducerStoreNode* op) final {
++    auto tensor = Downcast<te::Tensor>(op->producer);
++    used_tensors_.insert(tensor);
++    VLOG(1) << tensor << " hash: " << ObjectPtrHash()(tensor);
++    StmtExprVisitor::VisitStmt_(op);
++  }
++
++  std::unordered_set<te::Tensor> GetTensors(){
++    return this->used_tensors_;
++  }
++  private:
++  std::unordered_set<te::Tensor> used_tensors_;
++};
++
++std::unordered_set<te::Tensor> FGetTensorsFromStmtExpr(const tir::Stmt& stmt){
++  auto getter = GetTensorsFromStmtExpr();
++  getter(stmt);
++  return getter.GetTensors();
++}
++
++// Replace all Tensors in StmtExpr
++class ReplaceTensorsInStmtExpr : public StmtExprMutator {
++  public:
++  ReplaceTensorsInStmtExpr(std::unordered_map<te::Tensor, te::Tensor> replace_map)
++    : replace_map_(replace_map){};
++
++  PrimExpr VisitExpr_(const ProducerLoadNode* op) final {
++    auto ret = StmtExprMutator::VisitExpr_(op);
++    op = ret.as<ProducerLoadNode>();
++    auto tensor = Downcast<te::Tensor>(op->producer);
++    if(this->replace_map_.count(tensor)){
++      VLOG(1) << "replace " << tensor << " hash: " << ObjectPtrHash()(tensor) << " with "
++        << this->replace_map_[tensor] << " hash: " << ObjectPtrHash()(this->replace_map_[tensor]);
++      return ProducerLoad(this->replace_map_[tensor], op->indices);
++    }else{
++      return GetRef<ProducerLoad>(op);
++    }
++  }
++  
++  Stmt VisitStmt_(const ProducerStoreNode* op) final {
++    auto tensor = Downcast<te::Tensor>(op->producer);
++    auto ret = StmtExprMutator::VisitStmt_(op);
++    op = ret.as<ProducerStoreNode>();
++    if(this->replace_map_.count(tensor)){
++      VLOG(1) << "replace " << tensor << " hash: " << ObjectPtrHash()(tensor) << " with "
++        << this->replace_map_[tensor] << " hash: " << ObjectPtrHash()(this->replace_map_[tensor]);
++      return ProducerStore(this->replace_map_[tensor], op->value, op->indices, op->span);
++    }else{
++      return GetRef<ProducerStore>(op);
++    }
++  }
++
++  Stmt VisitStmt_(const ProducerRealizeNode* op) final {
++    auto tensor = Downcast<te::Tensor>(op->producer);;
++    auto ret = StmtExprMutator::VisitStmt_(op);
++    op = ret.as<ProducerRealizeNode>();
++    if(this->replace_map_.count(tensor)){
++      VLOG(1) << "replace " << tensor << " hash: " << ObjectPtrHash()(tensor) << " with "
++        << this->replace_map_[tensor] << " hash: " << ObjectPtrHash()(this->replace_map_[tensor]);
++      return ProducerRealize(this->replace_map_[tensor], op->bounds, op->condition, op->body, op->storage_scope);
++    }else{
++      return GetRef<ProducerRealize>(op);
++    }
++  }
++
++  private:
++  std::unordered_map<te::Tensor, te::Tensor> replace_map_;
++};
++
++Stmt FReplaceDataProducer(Stmt& stmt, std::unordered_map<te::Tensor, te::Tensor>& replace_map){
++  return ReplaceTensorsInStmtExpr(replace_map)(stmt);
++}
++
++// Print all tensors in StmtExpr using tir::PostOderVisit api
++void FVerifyTensorConnect(const te::Tensor& tensor){
++  Array<te::Tensor> ret;
++  std::unordered_set<te::Tensor> visited;
++  std::function<void(te::Tensor)> f_verify = [&](te::Tensor tensor) {
++    if(auto compute_op = tensor->op.as<te::ComputeOpNode>()){
++      for (auto& e : compute_op->body) {
++        tir::PostOrderVisit(e, [&ret, &visited, &f_verify](const ObjectRef& n) {
++          if (auto* pload = n.as<tir::ProducerLoadNode>()) {
++            te::Tensor t = Downcast<te::Tensor>(pload->producer);
++            VLOG(1) << t << " hash: " << ObjectPtrHash()(t);
++            if (!visited.count(t)) {
++              ret.push_back(t);
++              visited.insert(t);
++            }
++            f_verify(t);
++          }
++        });
++      }
++    }else if(auto placeholder_op = tensor->op.as<te::PlaceholderOpNode>()) {
++      VLOG(1) << placeholder_op;
++    }else{
++      LOG_DFATAL << "Error";
++    }
++  };
++  VLOG(1) << tensor << " hash: " << ObjectPtrHash()(tensor);
++  f_verify(tensor);
++}
++
++}
++}
++}
+diff --git a/src/tir/transforms/replace_tensors_in_expr_stmt.h b/src/tir/transforms/replace_tensors_in_expr_stmt.h
+new file mode 100644
+index 000000000..cee2a47ab
+--- /dev/null
++++ b/src/tir/transforms/replace_tensors_in_expr_stmt.h
+@@ -0,0 +1,24 @@
++#ifndef REPLACE_TENSORS_IN_EXPR_STMT_H
++#define REPLACE_TENSORS_IN_EXPR_STMT_H
++
++#include <tvm/relay/analysis.h>
++#include <tvm/relay/expr_functor.h>
++#include <tvm/relay/attrs/nn.h>
++#include <tvm/relay/op_attr_types.h>
++#include <tvm/relay/transform.h>
++#include <tvm/tir/op.h>
++#include <tvm/te/operation.h>
++#include <tvm/tir/stmt_functor.h>
++#include <tvm/topi/transform.h>
++
++namespace tvm{
++namespace tir{
++namespace transforms{
++  void FVerifyTensorConnect(const te::Tensor& tensor);
++  std::unordered_set<te::Tensor> FGetTensorsFromStmtExpr(const tir::Stmt& stmt);
++  Stmt FReplaceDataProducer(Stmt& stmt, std::unordered_map<te::Tensor, te::Tensor>& replace_map);
++}
++}
++}
++
++#endif
+\ No newline at end of file
+diff --git a/src/topi/transform.cc b/src/topi/transform.cc
+index db54d5a99..23f850d44 100644
+--- a/src/topi/transform.cc
++++ b/src/topi/transform.cc
+@@ -58,6 +58,10 @@ TVM_REGISTER_GLOBAL("topi.squeeze").set_body([](TVMArgs args, TVMRetValue* rv) {
+   *rv = squeeze(args[0], ArrayOrInt(args[1]));
+ });
+ 
++TVM_REGISTER_GLOBAL("topi.concatenate_expand").set_body([](TVMArgs args, TVMRetValue* rv) {
++  *rv = concatenate_expand(args[0]);
++});
++
+ TVM_REGISTER_GLOBAL("topi.concatenate").set_body([](TVMArgs args, TVMRetValue* rv) {
+   *rv = concatenate(args[0], args[1]);
+ });
+diff --git a/tests/python/relay/test_souffle_fusion.py b/tests/python/relay/test_souffle_fusion.py
+new file mode 100644
+index 000000000..774446121
+--- /dev/null
++++ b/tests/python/relay/test_souffle_fusion.py
+@@ -0,0 +1,211 @@
++from typing import Tuple
++import tvm
++from tvm import relay, te
++from tvm.relay import transform
++from tvm.relay.op.nn.nn import relu
++from tvm.relay.testing import run_opt_pass
++import tvm.testing
++import tvm.topi.testing
++from tvm.contrib import graph_executor
++import numpy as np
++
++print(tvm.__file__)
++
++
++def build_and_run(expr_relay, input_shape, output_shape):
++    opt_level = 0
++    target = tvm.target.cuda()
++    mod, params = relay.testing.create_workload(expr_relay)
++    print(params)
++    with tvm.transform.PassContext(opt_level=opt_level):
++        lib = relay.build(mod, target, params=params)
++        lib.export_library("ffff.cu")
++    dev = tvm.cuda()
++    data = np.ones(input_shape)
++    # create module
++    module = graph_executor.GraphModule(lib["default"](dev))
++    # set input and parameters
++    module.set_input("data", data)
++    # run
++    module.run()
++    # get output
++    out = module.get_output(0, tvm.nd.empty(output_shape)).numpy()
++    print(out)
++
++
++def test_fuse_simple():
++    """Simple testcase."""
++
++    def before():
++        x = relay.var("data", shape=(10, 20))
++        y = relay.add(x, relay.const(1, "float32"))
++        z = relay.exp(y)
++        w = relay.squeeze(z)
++        return relay.Function([x], w)
++
++    def expected():
++        x = relay.var("p", shape=(10, 20))
++        y = relay.add(x, relay.const(1, "float32"))
++        z = relay.exp(y)
++        w = relay.squeeze(z)
++        f1 = relay.Function([x], w)
++        f1 = f1.with_attr("Primitive", tvm.tir.IntImm("int32", 1))
++        x = relay.var("x", shape=(10, 20))
++        y = relay.Call(f1, [x])
++        return relay.Function([x], y)
++
++    z = before()
++    print(z)
++    zz = run_opt_pass(z, transform.FuseOps())
++    print(zz)
++    after = run_opt_pass(expected(), transform.InferType())
++    print(after)
++    assert tvm.ir.structural_equal(zz, after)
++
++    opt_level = 0
++    target = tvm.target.cuda()
++    mod, params = relay.testing.create_workload(before())
++    print(params)
++    with tvm.transform.PassContext(opt_level=opt_level):
++        lib = relay.build(mod, target, params=params)
++        lib.export_library("ffff.cu")
++    dev = tvm.cuda()
++    data = np.ones((10,20))
++    # create module
++    module = graph_executor.GraphModule(lib["default"](dev))
++    # set input and parameters
++    module.set_input("data", data)
++    # run
++    module.run()
++    # get output
++    out = module.get_output(0, tvm.nd.empty((10,20))).numpy()
++    print(out)
++
++
++
++def test_conv_relu_fusion():
++
++    def simple_conv_relu():
++        input_shape = (1, 1, 4, 4)
++        weight_shape = (1, 1, 1, 1)
++        output_shape = (1, 2, 4, 4)
++        x = relay.var("data", shape=input_shape)
++        w1 = relay.const(np.ones(weight_shape, dtype=np.float32), dtype="float32")
++        w2 = relay.const(np.ones(weight_shape, dtype=np.float32), dtype="float32")
++        # w1 = relay.var("weight1", shape=weight_shape)
++        # w2 = relay.var("weight2", shape=weight_shape)
++        # tgt_gpu = tvm.target.Target(target='cuda', host='llvm')
++        # dev = tvm.device(tgt_gpu.kind.name, 0)
++        # w = tvm.nd.array(np.ones((16, 3, 1, 1)).astype(np.float32), dev)
++        y1 = relay.nn.conv2d(x, w1)
++        z1 = relay.nn.relu(y1)
++        y2 = relay.nn.conv2d(x, w2)
++        z2 = relay.nn.relu(y2)
++        z = relay.concatenate([z1, z2], axis=1)
++        return relay.Function([x], z), input_shape, output_shape
++
++    weight2_shape = (1, 1, 3, 3)
++    def simple_2_conv_relu():
++        input_shape = (1, 1, 4, 4)
++        weight_shape = (1, 1, 1, 1)
++        output_shape = (1, 2, 4, 4)
++        x = relay.var("data", shape=input_shape)
++        w1 = relay.const(np.ones(weight_shape, dtype=np.float32), dtype="float32")
++        w2 = relay.const(np.ones(weight2_shape, dtype=np.float32), dtype="float32")
++        y1 = relay.nn.conv2d(x, w1)
++        z1 = relay.nn.relu(y1)
++        y2 = relay.nn.conv2d(x, w2, padding=(1, 1))
++        z2 = relay.nn.relu(y2)
++        z = relay.concatenate([z1, z2], axis=1)
++        return relay.Function([x], z), input_shape, output_shape
++
++    def simple_diamond_add():
++        input_shape = (1, 1, 4, 4)
++        output_shape = (1, 1, 4, 4)
++        x = relay.var("data", shape=input_shape)
++        y = relay.var("data", shape=input_shape)
++        w1 = relay.const(np.ones(input_shape, dtype=np.float32), dtype="float32")
++        w2 = relay.const(np.ones(input_shape, dtype=np.float32), dtype="float32")
++        z = relay.add(x, y)
++        p = relay.add(z, w1)
++        q = relay.add(z, w2)
++        r = relay.add(p, q)
++        return relay.Function([x, y], r), input_shape, output_shape
++
++    def single_softmax():
++        input_shape = (1, 1, 4, 4)
++        output_shape = (1, 1, 4, 4)
++        x = relay.var("data", shape=input_shape)
++        y = relay.nn.softmax(x, axis=3)
++        return relay.Function([x], y), input_shape, output_shape
++
++
++    def single_conv3x3_batchnorm():
++        # def reference(x, gamma, beta, moving_mean, moving_var):
++        #     return (x - moving_mean) / np.sqrt(moving_var + eps) * gamma + beta
++        in_channel, out_channel = 3, 8
++        input_shape = (1, in_channel, 16, 16)
++        weight_shape = (out_channel, in_channel, 3, 3)
++        output_shape = (1, out_channel, 16, 16)
++        x = relay.var("data", shape=input_shape)
++        w1 = relay.const(np.ones(weight_shape, dtype=np.float32), dtype="float32")
++        gamma_const = relay.const([0.1]*in_channel, dtype="float32")
++        beta_const = relay.const([0.2]*in_channel, dtype="float32")
++        moving_mean = relay.const([0.3]*in_channel, dtype="float32")
++        moving_var = relay.const([0.4]*in_channel, dtype="float32")
++        y = relay.nn.conv2d(x, w1, padding=(1,1))
++        z = relay.nn.relu(y)
++        # z = relay.nn.batch_norm(x, gamma_const, beta_const, moving_mean, moving_var)[0]
++        return relay.Function([x], z), input_shape, output_shape
++    
++    def conv3x3_relu_2way():
++        in_channel, out_channel = 3, 8
++        input_shape = (1, in_channel, 16, 16)
++        weight_shape = (out_channel, in_channel, 3, 3)
++        output_shape = (1, out_channel, 16, 16)
++        x1 = relay.var("data", shape=input_shape)
++        w1 = relay.const(np.ones(weight_shape, dtype=np.float32), dtype="float32")
++        y1 = relay.nn.conv2d(x1, w1, padding=(1,1))
++        z1 = relay.nn.relu(y1)
++        x2 = relay.var("data", shape=input_shape)
++        w2 = relay.const(np.ones(weight_shape, dtype=np.float32), dtype="float32")
++        y2 = relay.nn.conv2d(x2, w2, padding=(1,1))
++        z2 = relay.nn.relu(y2)
++        output = relay.concatenate([z1, z2], axis=1)
++        return relay.Function([x1, x2], z), input_shape, output_shape
++        
++
++    # z = simple_conv_relu()
++    # z = simple_2_conv_relu()
++    # z, input_shape, output_shape = simple_diamond_add()
++    # z, input_shape, output_shape = single_softmax()
++    z, input_shape, output_shape = single_conv3x3_batchnorm()
++    print(z)
++    print("Start fuse "*5)
++    # zz = run_opt_pass(z, transform.FuseOps())
++    # zz = run_opt_pass(z, transform.HorizonFuseOps())
++    # print(zz)
++    
++    opt_level = 5
++    target = tvm.target.cuda()
++    mod, params = relay.testing.create_workload(z)
++    print(params)
++    with tvm.transform.PassContext(opt_level=opt_level):
++        lib = relay.build(mod, target, params=params)
++        lib.export_library("ffff.cu")
++    dev = tvm.cuda()
++    data = np.ones(input_shape)
++    # create module
++    module = graph_executor.GraphModule(lib["default"](dev))
++    # set input and parameters
++    module.set_input("data", data)
++    # run
++    module.run()
++    # get output
++    out = module.get_output(0, tvm.nd.empty(output_shape)).numpy()
++    print(out)
++
++
++if __name__=="__main__":
++    # test_fuse_simple()
++    test_conv_relu_fusion()
+diff --git a/tests/python/topi/python/test_topi_transform.py b/tests/python/topi/python/test_topi_transform.py
+index 42d2463b8..96f58ec05 100644
+--- a/tests/python/topi/python/test_topi_transform.py
++++ b/tests/python/topi/python/test_topi_transform.py
+@@ -132,6 +132,48 @@ def verify_squeeze(src_shape, axis):
+         check_device(target, dev)
+ 
+ 
++def verify_concatenate_expand(shapes):
++    def get_concat_expand_schedule(target):
++        schedule_map = {
++            "cpu": topi.x86.schedule_concatenate_expand,
++            "arm_cpu": topi.arm_cpu.schedule_concatenate_expand,
++        }
++        if isinstance(target, str):
++            target = tvm.target.Target(target)
++        for key in target.keys:
++            if key in schedule_map:
++                return schedule_map[key]
++        return tvm.topi.testing.get_injective_schedule(target)
++
++    tensor_l = []
++    num_tensor = 0
++    for i, shape in enumerate(shapes):
++        tensor_l.append(te.placeholder(shape, name="A" + str(i)))
++        num_tensor+=1
++    out_tensor = topi.concatenate_expand(a_tuple=tensor_l)
++
++    def check_device(target, dev):
++        print("Running on target: %s" % target)
++        with tvm.target.Target(target):
++            s = get_concat_expand_schedule(target)(out_tensor)
++
++        foo = tvm.build(s, tensor_l + [out_tensor], target, name="concatenate_expand")
++        print(tvm.lower(s, tensor_l + [out_tensor]))
++        data_npys = [np.random.normal(size=shape).astype(tensor_l[0].dtype) for shape in shapes]
++        out_npy = np.concatenate(data_npys, axis=0)
++        new_out_shape = [num_tensor]
++        for s in shapes[0]:
++            new_out_shape.append(s)
++        out_npy = np.reshape(out_npy, new_out_shape)
++        data_nds = [tvm.nd.array(data_npy, dev) for data_npy in data_npys]
++        out_nd = tvm.nd.empty(out_npy.shape, device=dev, dtype=out_tensor.dtype)
++        foo(*(data_nds + [out_nd]))
++        tvm.testing.assert_allclose(out_nd.numpy(), out_npy)
++
++    for target, dev in tvm.testing.enabled_targets():
++        check_device(target, dev)
++
++
+ def verify_concatenate(shapes, axis):
+     def get_concat_schedule(target):
+         schedule_map = {
+@@ -937,6 +979,15 @@ def test_squeeze():
+             assert c.numpy()[0] == 2
+ 
+ 
++@tvm.testing.uses_gpu
++def test_concatenate_expand():
++    verify_concatenate_expand([(2,), (2,), (2,)])
++    verify_concatenate_expand([(2, 3, 4), (2, 3, 4), (2, 3, 4)])
++    verify_concatenate_expand([(1, 2, 4), (1, 2, 4), (1, 2, 4), (1, 2, 4), (1, 2, 4)])
++    verify_concatenate_expand([(5, 6, 7, 3), (5, 6, 7, 3), (5, 6, 7, 3), (5, 6, 7, 3), (5, 6, 7, 3)])
++    verify_concatenate_expand([(1, 2400), (1, 2400), (1, 2400), (1, 2400)])
++
++
+ @tvm.testing.uses_gpu
+ def test_concatenate():
+     verify_concatenate([(2,), (2,), (2,)], -1)
+@@ -1252,6 +1303,8 @@ def test_adv_index():
+ 
+ if __name__ == "__main__":
+     test_strided_slice()
++    test_concatenate_expand()
++    exit(0)
+     test_concatenate()
+     test_stack()
+     test_transpose()
+diff --git a/tmp.txt b/tmp.txt
+new file mode 100644
+index 000000000..c1639d141
+--- /dev/null
++++ b/tmp.txt
+@@ -0,0 +1 @@
++python3: can't open file 'test_conv2d_relu_2branches.py': [Errno 2] No such file or directory
